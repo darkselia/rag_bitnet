@@ -1,0 +1,40 @@
+### 1) Прямой запрос в BitNet (stream)
+# curl -N -X POST http://127.0.0.1:8080/completion \
+#   -H "Content-Type: application/json" \
+#   -d '{
+#         "prompt": "2+2=?",
+#         "n_predict": 64,
+#         "temperature": 0.2,
+#         "stream": true
+#       }'
+POST http://127.0.0.1:8080/completion
+Content-Type: application/json
+
+{
+  "prompt": "<|start_header_id|>user<|end_header_id|>\n2+2=\n<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n",
+  "n_predict": 64,
+  "temperature": 0.2,
+  "stream": true
+}
+
+###
+
+### 2) Запрос через API /ask (проксирует stream BitNet)
+# curl -N -X POST http://127.0.0.1:8000/ask \
+#   -H "Content-Type: application/json" \
+#   -d '{
+#         "query": "2+2=?",
+#         "top_k": 6,
+#         "temperature": 0.3
+#       }'
+POST http://127.0.0.1:8000/ask
+Content-Type: application/json
+
+{
+  "query": "2+2=?",
+  "top_k": 6,
+  "temperature": 0.3
+}
+
+
+
