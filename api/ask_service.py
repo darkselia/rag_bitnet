@@ -8,8 +8,8 @@ from starlette.responses import StreamingResponse
 
 from api.schemas import AskReq, AskResp
 from clients.llm import LLM, get_llm
-from core import config
-from core.prompt import build_prompt
+from common import config
+from rag.prompt import build_prompt
 
 _SOURCES_LINE_RE = re.compile(r"(?:^|\n)\s*(?:Sources|Источники)\s*:\s*(.*)$", re.IGNORECASE)
 _ID_RE = re.compile(r"\[([^\[\]]+)\]")
@@ -27,6 +27,8 @@ def _normalize_answer(answer: str, contexts: List[Dict]) -> tuple[str, List[str]
     clean_answer = _SOURCES_LINE_RE.sub("", answer).strip()
     context_ids = {str(c.get("id", "")) for c in contexts}
     source_ids = [sid for sid in _extract_source_ids(answer) if sid in context_ids]
+    if not source_ids:
+        source_ids = [str(c.get("id", "")) for c in contexts if c.get("id")]
 
     seen = set()
     deduped_source_ids = []
@@ -36,14 +38,25 @@ def _normalize_answer(answer: str, contexts: List[Dict]) -> tuple[str, List[str]
         seen.add(sid)
         deduped_source_ids.append(sid)
 
-    if deduped_source_ids:
-        clean_answer = f"{clean_answer}\n\nSources: " + ", ".join(f"[{sid}]" for sid in deduped_source_ids)
-
     return clean_answer, deduped_source_ids
 
 
+def _sources_line(contexts: List[Dict]) -> str:
+    ids = []
+    seen = set()
+    for context in contexts:
+        context_id = str(context.get("id", ""))
+        if not context_id or context_id in seen:
+            continue
+        seen.add(context_id)
+        ids.append(context_id)
+    if not ids:
+        return ""
+    return "\n\nSources: " + ", ".join(f"[{context_id}]" for context_id in ids)
+
+
 async def _build_rag_prompt(req: AskReq) -> tuple[str | None, List[Dict], float]:
-    from core.retrieval import retrieve_async
+    from rag.retrieval import retrieve_async
 
     started_at = time.time()
     contexts = await retrieve_async(req.query, 8, 8, req.top_k, 0.0, req.sources, req.site_domain)
@@ -60,12 +73,17 @@ def _temperature(req: AskReq) -> float:
     return req.temperature if req.temperature is not None else config.LLM_TEMPERATURE
 
 
-def _stream_answer(llm: LLM, prompt: str, req: AskReq, started_at: float) -> Iterator[str]:
+def _stream_answer(llm: LLM, prompt: str, req: AskReq, contexts: List[Dict], started_at: float) -> Iterator[str]:
     chunks: list[str] = []
     try:
         for piece in llm.generate_stream(prompt, config.LLM_MAX_TOKENS, _temperature(req)):
             chunks.append(piece)
             yield piece
+        answer = "".join(chunks)
+        if not _SOURCES_LINE_RE.search(answer):
+            line = _sources_line(contexts)
+            if line:
+                yield line
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"LLM error: {e}") from e
     finally:
@@ -76,7 +94,7 @@ def _stream_answer(llm: LLM, prompt: str, req: AskReq, started_at: float) -> Ite
 async def ask_json(req: AskReq, llm: LLM | None = None) -> AskResp:
     prompt, contexts, started_at = await _build_rag_prompt(req)
     if not prompt:
-        return AskResp(answer="Не нашёл ответа в базе.", sources=[], used_context=[])
+        return AskResp(answer="Couldn't find the answer in the database.", sources=[], used_context=[])
 
     llm = llm or get_llm()
     try:
@@ -95,13 +113,14 @@ async def ask_json(req: AskReq, llm: LLM | None = None) -> AskResp:
 
 
 async def ask_stream(req: AskReq, llm: LLM | None = None) -> StreamingResponse:
-    prompt, _, started_at = await _build_rag_prompt(req)
+    prompt, contexts, started_at = await _build_rag_prompt(req)
     if not prompt:
-        return StreamingResponse(iter(["Не нашёл ответа в базе."]), media_type="text/plain; charset=utf-8")
+        return StreamingResponse(iter(["Couldn't find the answer in the database."]),
+                                 media_type="text/plain; charset=utf-8")
 
     llm = llm or get_llm()
     return StreamingResponse(
-        _stream_answer(llm, prompt, req, started_at),
+        _stream_answer(llm, prompt, req, contexts, started_at),
         media_type="text/plain; charset=utf-8",
     )
 

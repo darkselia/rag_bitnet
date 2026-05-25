@@ -4,14 +4,14 @@ from fastapi import HTTPException
 from starlette.concurrency import run_in_threadpool
 
 from api.schemas import IngestFilesReq, IngestSiteReq
-from core import data_store
-from ingestion.ingest import ingest_folder, CrawlConfig, crawl_site
+from rag import data_store
+from rag.ingest import ingest_folder, CrawlConfig, crawl_site
 
 
 async def ingest_files(req: IngestFilesReq) -> dict:
     started_at = time.time()
     try:
-        added = await run_in_threadpool(ingest_folder, req.folder)
+        added = await run_in_threadpool(ingest_folder, req.folder, req.replace_existing)
         return {"added_chunks": added, "total_chunks": len(data_store.rows)}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

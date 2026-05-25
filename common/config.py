@@ -8,6 +8,7 @@ load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+
 def _env_str(name: str, default: str) -> str:
     value = os.getenv(name)
     if value is None:
@@ -31,11 +32,11 @@ def _env_int(name: str, default: int, *, min_value: int | None = None) -> int:
 
 
 def _env_float(
-    name: str,
-    default: float,
-    *,
-    min_value: float | None = None,
-    max_value: float | None = None,
+        name: str,
+        default: float,
+        *,
+        min_value: float | None = None,
+        max_value: float | None = None,
 ) -> float:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -85,7 +86,7 @@ CROSS_RERANKER_TOPK = _env_int("CROSS_RERANKER_TOPK", 12, min_value=1)
 EMBED_BATCH = _env_int("EMBED_BATCH", 64, min_value=1)
 RERANKER_BATCH = _env_int("RERANKER_BATCH", 16, min_value=1)
 
-LLM_PROVIDER = _env_str("LLM_PROVIDER", "bitnet").lower()
+LLM_PROVIDER = _env_str("LLM_PROVIDER", "BITNET").lower()
 LLM_MAX_TOKENS = _env_int("LLM_MAX_TOKENS", 300, min_value=1)
 LLM_TEMPERATURE = _env_float("LLM_TEMPERATURE", 0.6, min_value=0.0, max_value=2.0)
 

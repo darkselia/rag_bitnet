@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 class IngestFilesReq(BaseModel):
     folder: str
+    replace_existing: bool = False
 
 
 class IngestSiteReq(BaseModel):
@@ -13,8 +14,8 @@ class IngestSiteReq(BaseModel):
 
 
 class AskReq(BaseModel):
-    query: str
-    top_k: int = 6
+    query: str = Field(min_length=1)
+    top_k: int = Field(default=6, ge=1, le=50)
     sources: Optional[List[str]] = Field(default_factory=lambda: ["docs", "site"])
     site_domain: Optional[str] = None
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)

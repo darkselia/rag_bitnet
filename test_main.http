@@ -1,19 +1,23 @@
-
-### Ингест локальных файлов (TXT/MD) из папки
-# curl -X POST http://localhost:8000/ingest/files -H 'Content-Type: application/json'
-#  -d '{"folder": "./docs"}'
-POST http://localhost:8000/ingest/files
+### Ингест локальных TXT/MD файлов из папки docs с заменой уже проиндексированных чанков этих файлов
+# curl -X POST "http://127.0.0.1:8000/ingest/files" \
+#   -H "Content-Type: application/json" \
+#   -d '{"folder":"./docs","replace_existing":true}'
+# @timeout 600
+POST http://127.0.0.1:8000/ingest/files
 Content-Type: application/json
 
 {
-  "folder": "./docs"
+  "folder": "./docs",
+  "replace_existing": true
 }
 
 
-### Ингест определённого сайта (до 100 страниц одного домена)
-# curl -X POST http://localhost:8000/ingest/site -H 'Content-Type: application/json'
-#  -d '{"base_url": "https://example.com", "max_pages": 100}'
-POST http://localhost:8000/ingest/site
+### Ингест сайта example.com с обходом до 100 страниц в пределах одного домена
+# curl -X POST "http://127.0.0.1:8000/ingest/site" \
+#   -H "Content-Type: application/json" \
+#   -d '{"base_url":"https://example.com","max_pages":100}'
+# @timeout 600
+POST http://127.0.0.1:8000/ingest/site
 Content-Type: application/json
 
 {
@@ -22,10 +26,49 @@ Content-Type: application/json
 }
 
 
-### Задать вопрос (только из локальных документов):
-# curl -X POST http://localhost:8000/ask -H 'Content-Type: application/json'  -d '{"query": "This famous question and answer come from the Brothers Grimm fairy tale Snow White.?","sources": ["docs"],"top_k": 6,"temperature": 0.2}'
+### RAG вопрос только по локальным документам
+# curl -X POST "http://127.0.0.1:8000/ask" \
+#   -H "Content-Type: application/json" \
+#   -d '{"query":"This famous question and answer come from the Brothers Grimm fairy tale Snow White.?","sources":["docs"],"top_k":6,"temperature":0.2}'
 # @timeout 600
 POST http://127.0.0.1:8000/ask
+Content-Type: application/json
+
+{
+  "query": "In what order did the bun visit the animals?",
+  "sources": [
+    "docs"
+  ],
+  "top_k": 6,
+  "temperature": 0.5
+}
+
+### RAG вопрос по локальным документам и сайту с ограничением site_domain
+# curl -X POST "http://127.0.0.1:8000/ask" \
+#   -H "Content-Type: application/json" \
+#   -d '{"query":"О чем твоя база данных","sources":["docs","site"],"site_domain":"example.com","top_k":6,"temperature":0.4}'
+# @timeout 600
+POST http://127.0.0.1:8000/ask
+Content-Type: application/json
+
+{
+  "query": "What bun said to wolf?",
+  "sources": [
+    "docs",
+    "site"
+  ],
+  "site_domain": "example.com",
+  "top_k": 6,
+  "temperature": 0.4
+}
+
+
+### RAG потоковый ответ через /ask?type=stream только по локальным документам
+# curl -N -X POST "http://127.0.0.1:8000/ask?type=stream" \
+#   -H "Content-Type: application/json" \
+#   -d '{"query":"2+2=","sources":["docs"],"top_k":6,"temperature":0.2}'
+# @timeout 600
+POST http://127.0.0.1:8000/ask?type=stream
 Content-Type: application/json
 
 {
@@ -38,50 +81,11 @@ Content-Type: application/json
 }
 
 
-
-### Задать вопрос (только из локальных документов + сайта):
-# curl -X POST http://localhost:8000/ask -H 'Content-Type: application/json'
-#  -d '{
-#        "query": "Критерии диагностики железодефицитной анемии",
-#        "sources": ["docs", "site"],
-#        "site_domain": "example.com",
-#        "top_k": 6
-#      }'
-POST http://localhost:8000/ask
-Content-Type: application/json
-
-{
-  "query": "О чем твоя база данных",
-  "sources": [
-    "docs",
-    "site"
-  ],
-  "site_domain": "example.com",
-  "top_k": 6,
-  "temperature": 0.4
-}
-
-
-### /ask/stream (text/plain stream): потоковый ответ
-POST http://127.0.0.1:8000/ask/stream
-Content-Type: application/json
-
-{
-  "query": "2+2=",
-  "sources": [
-    "docs"
-  ],
-  "top_k": 6,
-  "temperature": 0.2
-}
-
-### Задать вопрос напрямую к LLM (без учёта локальных документов и сайта):
-#curl -X POST http://localhost:8000/completion -H 'Content-Type: application/json'
-# -d '{
-#       "prompt": "Client: Hi /n Assistant:",
-#       "n_predict": 200,
-#       "temperature": 0.7
-#     }'
+### Прямой запрос к BitNet completion без retrieval и без локального RAG контекста сервера
+# curl -N -X POST "http://127.0.0.1:8080/completion" \
+#   -H "Content-Type: application/json" \
+#   -d '{"prompt":"<|begin_of_text|><|start_header_id|>system<|end_header_id|>You are an assistant. Respond ONLY based on the provided Context. Do not use external knowledge. Always at the end, add the line '\''Sources: '\'' followed by the [id] of the chunks.<|eot_id|><|start_header_id|>user<|end_header_id|>Question: '\''2+2='\''\nContext:\n'\''[doc:file.txt:0]\n2+2=4'\''<|eot_id|><|start_header_id|>assistant<|end_header_id|>","temperature":0.2,"n_predict":128,"stream":true}'
+# @timeout 600
 POST http://127.0.0.1:8080/completion
 Content-Type: application/json
 

@@ -11,15 +11,55 @@ import tldextract
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
 
-from core import data_store
+from rag import data_store
 
 
 def normalize_ws(text: str) -> str:
     return re.sub(r"[ \t]+", " ", text).strip()
 
 
+def _stored_path(path: Path) -> str:
+    return str(path).replace("\\", "/")
+
+
+def _split_long_text(text: str, max_chars: int) -> List[str]:
+    pieces = []
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if len(sentence) <= max_chars:
+            pieces.append(sentence)
+            continue
+
+        words = sentence.split()
+        cur = ""
+        for word in words:
+            if len(word) > max_chars:
+                if cur:
+                    pieces.append(cur)
+                    cur = ""
+                pieces.extend(word[i:i + max_chars] for i in range(0, len(word), max_chars))
+                continue
+            if len(cur) + len(word) + 1 <= max_chars:
+                cur = f"{cur} {word}".strip()
+            else:
+                if cur:
+                    pieces.append(cur)
+                cur = word
+        if cur:
+            pieces.append(cur)
+    return pieces
+
+
 def chunk_text(text: str, max_chars: int = 1800, overlap: int = 200) -> List[str]:
-    paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    paras = []
+    for p in re.split(r"\n{2,}", text):
+        p = p.strip()
+        if not p:
+            continue
+        paras.extend(_split_long_text(p, max_chars))
+
     chunks, cur = [], ""
     for p in paras:
         if len(cur) + len(p) + 2 <= max_chars:
@@ -28,18 +68,19 @@ def chunk_text(text: str, max_chars: int = 1800, overlap: int = 200) -> List[str
             if cur:
                 chunks.append(cur)
             tail = cur[-overlap:] if overlap and cur else ""
+            if tail and len(tail) + len(p) + 2 > max_chars:
+                tail = ""
             cur = (tail + "\n\n" + p).strip()
     if cur:
         chunks.append(cur)
     return chunks
 
 
-def ingest_folder(folder: str) -> int:
+def ingest_folder(folder: str, replace_existing: bool = False) -> int:
     folder_path = Path(folder)
     if not folder_path.exists():
         raise FileNotFoundError(f"Folder not found: {folder}")
     files = [Path(p) for p in glob.glob(str(folder_path / "**/*"), recursive=True) if p.endswith((".txt", ".md"))]
-    added = 0
     new_chunks: List[Dict] = []
     for fp in files:
         text = fp.read_text(encoding="utf-8", errors="ignore")
@@ -53,12 +94,13 @@ def ingest_folder(folder: str) -> int:
                 "text": ch,
                 "source": str(fp.name),
                 "kind": "docs",
-                "meta": {"path": str(fp)}
+                "meta": {"path": _stored_path(fp)}
             })
-            added += 1
-    if new_chunks:
-        data_store.add_chunks(new_chunks)
-    return added
+    if not new_chunks:
+        return 0
+    if replace_existing:
+        return data_store.replace_chunks_by_paths({_stored_path(fp) for fp in files}, new_chunks)
+    return data_store.add_chunks(new_chunks)
 
 
 class CrawlConfig(BaseModel):
@@ -108,7 +150,7 @@ def crawl_site(cfg: CrawlConfig) -> int:
     visited = set()
     q = queue.Queue()
     q.put(cfg.base_url)
-    added = 0
+    all_chunks: List[Dict] = []
     while not q.empty() and len(visited) < cfg.max_pages:
         url = q.get()
         if url in visited:
@@ -131,9 +173,7 @@ def crawl_site(cfg: CrawlConfig) -> int:
                 "kind": "site",
                 "meta": {"url": url}
             })
-            added += 1
-        if new_chunks:
-            data_store.add_chunks(new_chunks)
+        all_chunks.extend(new_chunks)
 
         soup = BeautifulSoup(html, "html.parser")
         for a in soup.find_all("a", href=True):
@@ -147,4 +187,6 @@ def crawl_site(cfg: CrawlConfig) -> int:
             if re.search(r"\.(pdf|zip|jpg|png|gif|svg|mp4|mp3)$", nu, re.I):
                 continue
             q.put(nu)
-    return added
+    if not all_chunks:
+        return 0
+    return data_store.add_chunks(all_chunks)

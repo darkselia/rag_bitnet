@@ -3,7 +3,7 @@ import requests
 from collections.abc import Iterator
 
 from clients.llm import LLM
-from core import config
+from common import config
 
 
 class BitNetAPI(LLM):
@@ -35,10 +35,15 @@ class BitNetAPI(LLM):
         }
         with requests.post(self.url, json=payload, timeout=self.timeout, stream=True) as resp:
             resp.raise_for_status()
+            resp.encoding = "utf-8"
 
             # Stream chunks (SSE-like) and collect content pieces
             chunks_count = 0
-            for line in resp.iter_lines(decode_unicode=True):
+            for raw_line in resp.iter_lines(decode_unicode=False):
+                if isinstance(raw_line, bytes):
+                    line = raw_line.decode("utf-8", errors="replace")
+                else:
+                    line = raw_line
                 if not line:
                     continue
                 data_part = line[len("data:"):].strip() if line.startswith("data:") else line.strip()

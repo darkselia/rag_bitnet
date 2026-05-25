@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 
-from core import config
+from common import config
 
 
 class LLM(ABC):
@@ -26,7 +26,7 @@ class LLM(ABC):
 _llm: LLM | None = None
 
 
-def get_llm() -> LLM:
+def get_llm() -> LLM | None:
     global _llm
     if _llm is None:
         if config.LLM_PROVIDER == "bitnet":
