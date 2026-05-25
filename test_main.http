@@ -1,40 +1,93 @@
-### 1) Прямой запрос в BitNet (stream)
-# curl -N -X POST http://127.0.0.1:8080/completion \
-#   -H "Content-Type: application/json" \
-#   -d '{
-#         "prompt": "2+2=?",
-#         "n_predict": 64,
-#         "temperature": 0.2,
-#         "stream": true
-#       }'
-POST http://127.0.0.1:8080/completion
+
+### Ингест локальных файлов (TXT/MD) из папки
+# curl -X POST http://localhost:8000/ingest/files -H 'Content-Type: application/json'
+#  -d '{"folder": "./docs"}'
+POST http://localhost:8000/ingest/files
 Content-Type: application/json
 
 {
-  "prompt": "<|start_header_id|>user<|end_header_id|>\n2+2=\n<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n",
-  "n_predict": 64,
-  "temperature": 0.2,
-  "stream": true
+  "folder": "./docs"
 }
 
-###
 
-### 2) Запрос через API /ask (проксирует stream BitNet)
-# curl -N -X POST http://127.0.0.1:8000/ask \
-#   -H "Content-Type: application/json" \
-#   -d '{
-#         "query": "2+2=?",
-#         "top_k": 6,
-#         "temperature": 0.3
-#       }'
+### Ингест определённого сайта (до 100 страниц одного домена)
+# curl -X POST http://localhost:8000/ingest/site -H 'Content-Type: application/json'
+#  -d '{"base_url": "https://example.com", "max_pages": 100}'
+POST http://localhost:8000/ingest/site
+Content-Type: application/json
+
+{
+  "base_url": "https://example.com",
+  "max_pages": 100
+}
+
+
+### Задать вопрос (только из локальных документов):
+# curl -X POST http://localhost:8000/ask -H 'Content-Type: application/json'  -d '{"query": "This famous question and answer come from the Brothers Grimm fairy tale Snow White.?","sources": ["docs"],"top_k": 6,"temperature": 0.2}'
+# @timeout 600
 POST http://127.0.0.1:8000/ask
 Content-Type: application/json
 
 {
-  "query": "2+2=?",
+  "query": "What bun said to wolf?",
+  "sources": [
+    "docs"
+  ],
   "top_k": 6,
-  "temperature": 0.3
+  "temperature": 0.2
 }
 
 
 
+### Задать вопрос (только из локальных документов + сайта):
+# curl -X POST http://localhost:8000/ask -H 'Content-Type: application/json'
+#  -d '{
+#        "query": "Критерии диагностики железодефицитной анемии",
+#        "sources": ["docs", "site"],
+#        "site_domain": "example.com",
+#        "top_k": 6
+#      }'
+POST http://localhost:8000/ask
+Content-Type: application/json
+
+{
+  "query": "О чем твоя база данных",
+  "sources": [
+    "docs",
+    "site"
+  ],
+  "site_domain": "example.com",
+  "top_k": 6,
+  "temperature": 0.4
+}
+
+
+### /ask/stream (text/plain stream): потоковый ответ
+POST http://127.0.0.1:8000/ask/stream
+Content-Type: application/json
+
+{
+  "query": "2+2=",
+  "sources": [
+    "docs"
+  ],
+  "top_k": 6,
+  "temperature": 0.2
+}
+
+### Задать вопрос напрямую к LLM (без учёта локальных документов и сайта):
+#curl -X POST http://localhost:8000/completion -H 'Content-Type: application/json'
+# -d '{
+#       "prompt": "Client: Hi /n Assistant:",
+#       "n_predict": 200,
+#       "temperature": 0.7
+#     }'
+POST http://127.0.0.1:8080/completion
+Content-Type: application/json
+
+{
+  "prompt": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>You are an assistant. Respond ONLY based on the provided Context. Do not use external knowledge. Always at the end, add the line 'Sources: ' followed by the [id] of the chunks.<|eot_id|><|start_header_id|>user<|end_header_id|>Question: '2+2='\nContext:\n'[doc:file.txt:0]\n2+2=4'<|eot_id|><|start_header_id|>assistant<|end_header_id|>",
+  "temperature": 0.2,
+  "n_predict": 128,
+  "stream": true
+}

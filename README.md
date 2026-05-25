@@ -3,10 +3,14 @@
 ## Запуск локально
 ```bash
 cp .env.example .env
-python main.py
+conda create -n rag-bitnet python=3.10 -y
+conda activate rag-bitnet
+pip install -r requirements.txt
 ```
-
-`core/config.py` автоматически читает `.env` (через `python-dotenv`) и применяет `os.getenv` с дефолтами и проверкой типов.
+```bash
+python main.py
+python3 run_inference_server.py -m models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf -t 6 
+```
 
 ## Docker (API + BitNet в одном контейнере)
 Собрать образ:
@@ -33,10 +37,16 @@ docker run --rm -p 8000:8000 -p 8080:8080 \
 - `API_HOST`, `API_PORT` - адрес и порт FastAPI.
 - `BITNET_HOST`, `BITNET_PORT` - где доступен BitNet inference server.
 - `BITNET_MAX_TOKENS`, `BITNET_TEMPERATURE`, `BITNET_TIMEOUT` - параметры генерации и тайм-аут запроса.
+- `DATA_DIR` - путь к хранилищу индекса/данных.
+- `USE_CROSS_RERANKER`, `CROSS_RERANKER_TOPK`, `RERANKER_BATCH`, `EMBED_BATCH` - настройки retrieval/pipeline.
 
 ## Структура
 - `rag_bitnet/config.py` — env/пути и параметры моделей.
 - `rag_bitnet/clients/bitnet_client.py` — клиент BitNet API.
 - `rag_bitnet/prompting/prompt.py` — сборка промпта.
 - `rag_bitnet/api/*` и `rag_bitnet/server.py` — FastAPI
+- `rag_bitnet/storage/data_store.py` — загрузка/сохранение индекса, faiss/BM25.
+- `rag_bitnet/models/*` — ленивые обёртки embedding и reranker.
+- `rag_bitnet/ingest/*` — загрузка файлов и краулер.
+- `rag_bitnet/retrieval/retrieve.py` — поиск + (опц.) реранк.
 

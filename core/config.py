@@ -1,10 +1,12 @@
 import os
 import time
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 def _env_str(name: str, default: str) -> str:
     value = os.getenv(name)
@@ -29,11 +31,11 @@ def _env_int(name: str, default: int, *, min_value: int | None = None) -> int:
 
 
 def _env_float(
-        name: str,
-        default: float,
-        *,
-        min_value: float | None = None,
-        max_value: float | None = None,
+    name: str,
+    default: float,
+    *,
+    min_value: float | None = None,
+    max_value: float | None = None,
 ) -> float:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -51,18 +53,60 @@ def _env_float(
     return value
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+
+    value = raw.strip().lower()
+    truthy = {"1", "true", "yes", "y", "on"}
+    falsy = {"0", "false", "no", "n", "off"}
+    if value in truthy:
+        return True
+    if value in falsy:
+        return False
+    raise ValueError(f"{name} must be boolean-like (true/false/1/0), got: {raw!r}")
+
+
+def _env_path(name: str, default: str) -> Path:
+    value = Path(_env_str(name, default))
+    if value.is_absolute():
+        return value.resolve()
+    return (PROJECT_ROOT / value).resolve()
+
+
+DATA_DIR = _env_path("DATA_DIR", "./data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+EMBED_MODEL = _env_str("EMBED_MODEL", "intfloat/multilingual-e5-base")
+RERANKER_MODEL = _env_str("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+USE_CROSS_RERANKER = _env_bool("USE_CROSS_RERANKER", True)
+CROSS_RERANKER_TOPK = _env_int("CROSS_RERANKER_TOPK", 12, min_value=1)
+EMBED_BATCH = _env_int("EMBED_BATCH", 64, min_value=1)
+RERANKER_BATCH = _env_int("RERANKER_BATCH", 16, min_value=1)
+
+LLM_PROVIDER = _env_str("LLM_PROVIDER", "bitnet").lower()
+LLM_MAX_TOKENS = _env_int("LLM_MAX_TOKENS", 300, min_value=1)
+LLM_TEMPERATURE = _env_float("LLM_TEMPERATURE", 0.6, min_value=0.0, max_value=2.0)
+
 BITNET_HOST = _env_str("BITNET_HOST", "127.0.0.1")
 BITNET_PORT = _env_int("BITNET_PORT", 8080, min_value=1)
-BITNET_MAX_TOKENS = _env_int("BITNET_MAX_TOKENS", 300, min_value=1)
-BITNET_TEMPERATURE = _env_float("BITNET_TEMPERATURE", 0.6, min_value=0.0, max_value=2.0)
 BITNET_TIMEOUT = _env_int("BITNET_TIMEOUT", 60000, min_value=1)
 
 API_HOST = _env_str("API_HOST", "0.0.0.0")
 API_PORT = _env_int("API_PORT", 8000, min_value=1)
+
+CORPUS_JSONL = DATA_DIR / "rows.jsonl"
+EMB_NPY = DATA_DIR / "embeddings.npy"
+FAISS_INDEX = DATA_DIR / "index.faiss"
+BM25_JSON = DATA_DIR / "bm25_corpus.json"
+META_JSON = DATA_DIR / "meta.json"
 
 
 def meta_payload(count: int) -> dict:
     return {
         "count": count,
         "updated_at": time.time(),
+        "embed_model": EMBED_MODEL,
+        "reranker": RERANKER_MODEL,
     }
