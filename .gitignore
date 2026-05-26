@@ -3,3 +3,6 @@
 .env.local
 __pycache__/
 *.pyc
+docs/
+data/
+*_old.*

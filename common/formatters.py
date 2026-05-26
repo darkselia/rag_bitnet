@@ -1,0 +1,393 @@
+import json
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable, Optional
+from urllib.parse import urljoin, urldefrag
+
+import requests
+import tldextract
+from bs4 import BeautifulSoup
+
+
+def _log(message: str) -> None:
+    print(f"[site-format] {message}", flush=True)
+
+
+@dataclass(frozen=True)
+class FormattedDocument:
+    text: str
+    source: str
+    kind: str
+    meta: dict = field(default_factory=dict)
+    stable_id: str = ""
+
+
+def normalize_ws(text: str) -> str:
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+
+def _stored_path(path: Path) -> str:
+    return str(path).replace("\\", "/")
+
+
+def text_file_to_document(path: Path) -> Optional[FormattedDocument]:
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    text = normalize_ws(text)
+    if not text:
+        return None
+    return FormattedDocument(
+        text=text,
+        source=path.name,
+        kind="docs",
+        meta={"path": _stored_path(path)},
+        stable_id=f"doc:{_stored_path(path)}",
+    )
+
+
+def html_to_text(html: str) -> str:
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
+            tag.decompose()
+        return re.sub(r"\s+", " ", soup.get_text(" ")).strip()
+    except Exception:
+        return ""
+
+
+def html_file_to_document(path: Path) -> Optional[FormattedDocument]:
+    html = path.read_text(encoding="utf-8", errors="ignore")
+    text = html_to_text(html)
+    if not text:
+        return None
+    return FormattedDocument(
+        text=text,
+        source=path.name,
+        kind="docs",
+        meta={"path": _stored_path(path)},
+        stable_id=f"doc:{_stored_path(path)}",
+    )
+
+
+def pdf_file_to_document(path: Path) -> Optional[FormattedDocument]:
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        try:
+            from PyPDF2 import PdfReader
+        except ImportError as e:
+            raise RuntimeError("PDF ingest requires pypdf or PyPDF2 to be installed") from e
+
+    reader = PdfReader(str(path))
+    pages = []
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        if text.strip():
+            pages.append(text)
+    text = normalize_ws("\n\n".join(pages))
+    if not text:
+        return None
+    return FormattedDocument(
+        text=text,
+        source=path.name,
+        kind="docs",
+        meta={"path": _stored_path(path)},
+        stable_id=f"doc:{_stored_path(path)}",
+    )
+
+
+def file_to_document(path: Path) -> Optional[FormattedDocument]:
+    suffix = path.suffix.lower()
+    if suffix in {".txt", ".md"}:
+        return text_file_to_document(path)
+    if suffix in {".html", ".htm"}:
+        return html_file_to_document(path)
+    if suffix == ".pdf":
+        return pdf_file_to_document(path)
+    return None
+
+
+def same_domain(u1: str, u2: str) -> bool:
+    d1 = tldextract.extract(u1)
+    d2 = tldextract.extract(u2)
+    return (d1.domain, d1.suffix) == (d2.domain, d2.suffix)
+
+
+def canon_url(base: str, url: str) -> Optional[str]:
+    if not url:
+        return None
+    joined = urljoin(base, url)
+    clean, _ = urldefrag(joined)
+    return clean
+
+
+def fetch_text(url: str, *, timeout: int, user_agent: str, content_types: Iterable[str]) -> Optional[str]:
+    try:
+        r = requests.get(url, headers={"User-Agent": user_agent}, timeout=timeout)
+        content_type = r.headers.get("Content-Type", "")
+        expected = tuple(content_types)
+        _log(
+            f"fetch url={url} status={r.status_code} "
+            f"content_type={content_type!r} bytes={len(r.content)} expected={expected}"
+        )
+        if r.status_code != 200:
+            _log(f"skip url={url} reason=status_not_200")
+            return None
+        if not any(t in content_type for t in expected):
+            _log(f"skip url={url} reason=unexpected_content_type")
+            return None
+        return r.text
+    except Exception as e:
+        _log(f"fetch failed url={url} error={type(e).__name__}: {e}")
+        return None
+
+
+def _is_skipped_asset(url: str) -> bool:
+    return bool(re.search(r"\.(pdf|zip|jpg|jpeg|png|gif|svg|mp4|mp3|ico|webp|css)(?:\?|$)", url, re.I))
+
+
+def discover_page_links(base_url: str, page_url: str, html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    urls = []
+    for a in soup.find_all("a", href=True):
+        url = canon_url(page_url, a.get("href"))
+        if url and same_domain(base_url, url) and not _is_skipped_asset(url):
+            urls.append(url)
+    return list(dict.fromkeys(urls))
+
+
+def discover_html_assets(base_url: str, page_url: str, html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    urls = []
+    for tag in soup.find_all(["script", "link"]):
+        raw_url = tag.get("src") or tag.get("href")
+        url = canon_url(page_url, raw_url)
+        if url and same_domain(base_url, url) and not _is_skipped_asset(url):
+            urls.append(url)
+    return list(dict.fromkeys(urls))
+
+
+def discover_json_urls_from_js(base_url: str, js_url: str, js_text: str) -> list[str]:
+    urls = []
+    for match in re.finditer(r'["\']([^"\']+\.json(?:\?[^"\']*)?)["\']', js_text, re.I):
+        url = canon_url(js_url, match.group(1))
+        if url and same_domain(base_url, url):
+            urls.append(url)
+    return list(dict.fromkeys(urls))
+
+
+def _stringify_json_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    return ""
+
+
+def _format_json_value(value: Any, prefix: str = "") -> list[str]:
+    scalar = _stringify_json_value(value)
+    if scalar:
+        return [f"{prefix}: {scalar}" if prefix else scalar]
+
+    if isinstance(value, dict):
+        lines = []
+        for key, nested_value in value.items():
+            key_prefix = f"{prefix}.{key}" if prefix else str(key)
+            lines.extend(_format_json_value(nested_value, key_prefix))
+        return lines
+
+    if isinstance(value, list):
+        lines = []
+        for i, nested_value in enumerate(value):
+            item_prefix = f"{prefix}[{i}]" if prefix else f"[{i}]"
+            lines.extend(_format_json_value(nested_value, item_prefix))
+        return lines
+
+    return []
+
+
+def _record_id_from_json(value: Any, fallback: str) -> str:
+    if isinstance(value, dict):
+        for key in ("id", "_id", "uuid", "slug", "key"):
+            record_id = _stringify_json_value(value.get(key))
+            if record_id:
+                return f"{fallback}:{record_id}"
+    return fallback
+
+
+def _has_scalar_fields(value: dict[str, Any]) -> bool:
+    return any(_stringify_json_value(nested_value) for nested_value in value.values())
+
+
+def _flatten_json_records(data: Any, path: str = "") -> list[tuple[str, str]]:
+    if isinstance(data, dict):
+        if _has_scalar_fields(data):
+            lines = _format_json_value(data)
+            if lines:
+                return [(_record_id_from_json(data, path or "root"), "\n".join(lines))]
+
+        records = []
+        for key, value in data.items():
+            next_path = f"{path}.{key}" if path else str(key)
+            records.extend(_flatten_json_records(value, next_path))
+        return records
+
+    if isinstance(data, list):
+        records = []
+        for i, value in enumerate(data):
+            item_path = f"{path}[{i}]" if path else f"[{i}]"
+            if isinstance(value, dict):
+                lines = _format_json_value(value)
+                if lines:
+                    records.append((_record_id_from_json(value, item_path), "\n".join(lines)))
+                continue
+
+            if isinstance(value, list):
+                nested = _flatten_json_records(value, item_path)
+                if nested:
+                    records.extend(nested)
+                continue
+
+            lines = _format_json_value(value)
+            if lines:
+                records.append((item_path, "\n".join(lines)))
+        return records
+
+    lines = _format_json_value(data)
+    if lines:
+        return [(path or "root", "\n".join(lines))]
+    return []
+
+
+def json_to_documents(json_url: str, json_text: str) -> list[FormattedDocument]:
+    try:
+        data = json.loads(json_text)
+    except json.JSONDecodeError as e:
+        _log(f"json parse failed url={json_url} error={e}")
+        return []
+
+    documents = []
+    for i, (record_id, text) in enumerate(_flatten_json_records(data)):
+        text = normalize_ws(text)
+        if not text:
+            continue
+        stable_id = f"site-json:{json_url}#{record_id or i}"
+        documents.append(FormattedDocument(
+            text=text,
+            source=json_url,
+            kind="site",
+            meta={"url": json_url, "record_id": record_id},
+            stable_id=stable_id,
+        ))
+    _log(f"json formatted url={json_url} documents={len(documents)}")
+    return documents
+
+
+def site_to_documents(
+        base_url: str,
+        *,
+        max_pages: int,
+        timeout: int,
+        user_agent: str,
+) -> list[FormattedDocument]:
+    visited_pages = set()
+    visited_assets = set()
+    queue = [base_url]
+    documents: list[FormattedDocument] = []
+    _log(f"start base_url={base_url} max_pages={max_pages}")
+
+    while queue and len(visited_pages) < max_pages:
+        url = queue.pop(0)
+        if url in visited_pages:
+            continue
+        visited_pages.add(url)
+        _log(f"page start url={url} visited_pages={len(visited_pages)} queue={len(queue)}")
+
+        html = fetch_text(url, timeout=timeout, user_agent=user_agent, content_types=("text/html",))
+        if not html:
+            _log(f"page skip url={url} reason=no_html")
+            continue
+
+        text = html_to_text(html)
+        _log(f"page text url={url} html_chars={len(html)} text_chars={len(text)}")
+        if len(text) >= 200:
+            documents.append(FormattedDocument(
+                text=text,
+                source=url,
+                kind="site",
+                meta={"url": url},
+                stable_id=f"site-html:{url}",
+            ))
+            _log(f"page document added url={url}")
+        else:
+            _log(f"page document skipped url={url} reason=text_too_short threshold=200")
+
+        page_links = discover_page_links(base_url, url, html)
+        assets = discover_html_assets(base_url, url, html)
+        _log(f"page discovered url={url} links={len(page_links)} assets={len(assets)}")
+
+        for link in page_links:
+            if link not in visited_pages and link not in queue:
+                queue.append(link)
+
+        for asset_url in assets:
+            if asset_url in visited_assets:
+                continue
+            visited_assets.add(asset_url)
+            _log(f"asset start url={asset_url}")
+
+            if re.search(r"\.json(?:\?|$)", asset_url, re.I):
+                json_text = fetch_text(
+                    asset_url,
+                    timeout=timeout,
+                    user_agent=user_agent,
+                    content_types=("application/json", "text/json", "text/plain"),
+                )
+                if json_text:
+                    json_documents = json_to_documents(asset_url, json_text)
+                    documents.extend(json_documents)
+                    _log(f"asset json added url={asset_url} documents={len(json_documents)}")
+                else:
+                    _log(f"asset json skipped url={asset_url} reason=no_text")
+                continue
+
+            if re.search(r"\.js(?:\?|$)", asset_url, re.I):
+                js_text = fetch_text(
+                    asset_url,
+                    timeout=timeout,
+                    user_agent=user_agent,
+                    content_types=("javascript", "ecmascript", "text/plain"),
+                )
+                if not js_text:
+                    _log(f"asset js skipped url={asset_url} reason=no_text")
+                    continue
+
+                json_urls = discover_json_urls_from_js(base_url, asset_url, js_text)
+                _log(f"asset js scanned url={asset_url} js_chars={len(js_text)} json_urls={len(json_urls)}")
+                for json_url in json_urls:
+                    if json_url in visited_assets:
+                        continue
+                    visited_assets.add(json_url)
+                    _log(f"js json start url={json_url} from={asset_url}")
+                    json_text = fetch_text(
+                        json_url,
+                        timeout=timeout,
+                        user_agent=user_agent,
+                        content_types=("application/json", "text/json", "text/plain"),
+                    )
+                    if json_text:
+                        json_documents = json_to_documents(json_url, json_text)
+                        documents.extend(json_documents)
+                        _log(f"js json added url={json_url} documents={len(json_documents)}")
+                    else:
+                        _log(f"js json skipped url={json_url} reason=no_text")
+            else:
+                _log(f"asset skipped url={asset_url} reason=unsupported_asset_type")
+
+    _log(
+        f"done base_url={base_url} pages={len(visited_pages)} "
+        f"assets={len(visited_assets)} documents={len(documents)}"
+    )
+    return documents
