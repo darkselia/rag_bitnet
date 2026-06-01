@@ -4,12 +4,34 @@ FastAPI-сервис для RAG-чата поверх локальных док�
 
 ## Возможности
 
-- Индексация локальных `.txt` и `.md` файлов.
+- Индексация локальных `.txt`, `.pdf` и `.md` файлов.
 - Индексация HTML-страниц одного домена.
 - Гибридный retrieval: dense embeddings через `sentence-transformers`, BM25 и optional cross-encoder reranker.
 - JSON-ответы и streaming-ответы.
-- Детерминированное поле `sources` в API-ответе.
 - Persisted index в папке `data/`.
+- Файловые логи в папке `logs/` в корне репозитория. 
+
+## Зависимости
+
+Список основных Python‑пакетов (также в `requirements.txt`):
+
+```
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+pydantic==2.7.1
+python-dotenv==1.0.1
+numpy==1.26.4
+faiss-cpu==1.8.0
+sentence-transformers==2.7.0
+rank-bm25==0.2.2
+beautifulsoup4==4.12.3
+tldextract==5.1.2
+readability-lxml==0.8.1
+requests==2.32.3
+pypdf==4.3.1
+```
+
+Некоторые дополнительные зависимости могут потребоваться для конкретных функций (например, `transformers`, `torch` и т.п.) — проверь `requirements.txt` и окружение перед разворачиванием моделей.
 
 ## Структура
 
@@ -50,7 +72,8 @@ conda activate rag-bitnet
 pip install -r requirements.txt
 ```
 
-BitNet inference server запускается отдельно:
+BitNet inference server устанавливается отдельно:
+https://github.com/microsoft/BitNet
 
 ```bash
 cd /path/to/BitNet

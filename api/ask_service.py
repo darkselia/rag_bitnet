@@ -10,6 +10,9 @@ from api.schemas import AskReq, AskResp
 from clients.llm import LLM, get_llm
 from common import config
 from rag.prompt import build_prompt
+from common.logger import get_logger
+
+logger = get_logger("api")
 
 _SOURCES_LINE_RE = re.compile(r"(?:^|\n)\s*(?:Sources|Источники)\s*:\s*(.*)$", re.IGNORECASE)
 _ID_RE = re.compile(r"\[([^\[\]]+)\]")
@@ -60,12 +63,12 @@ async def _build_rag_prompt(req: AskReq) -> tuple[str | None, List[Dict], float]
 
     started_at = time.time()
     contexts = await retrieve_async(req.query, 8, 8, req.top_k, 0.0, req.sources, req.site_domain)
-    print("RETRIEVE TIME:", time.time() - started_at)
+    logger.info("RETRIEVE TIME: %s", time.time() - started_at)
     if not contexts:
         return None, [], started_at
 
     prompt = build_prompt(req.query, contexts)
-    print("PROMPT:", prompt)
+    logger.debug("PROMPT: %s", prompt)
     return prompt, contexts, time.time()
 
 
@@ -88,15 +91,19 @@ def _stream_answer(llm: LLM, prompt: str, req: AskReq, contexts: List[Dict], sta
         raise HTTPException(status_code=500, detail=f"LLM error: {e}") from e
     finally:
         answer = "".join(chunks)
-        print("LLM ANSWER:", answer, time.time() - started_at)
+        logger.info("LLM TIME: elapsed=%s)", time.time() - started_at)
+        logger.info("LLM ANSWER: %s", answer)
 
 
-async def ask_json(req: AskReq, llm: LLM | None = None) -> AskResp:
+async def ask_json(req: AskReq, llm: LLM | None = None) -> AskResp | HTTPException:
     prompt, contexts, started_at = await _build_rag_prompt(req)
     if not prompt:
         return AskResp(answer="Couldn't find the answer in the database.", sources=[], used_context=[])
 
     llm = llm or get_llm()
+    if llm is None:
+        return HTTPException(status_code=500, detail=f"LLM error: no LLM configured")
+
     try:
         raw_answer = await run_in_threadpool(
             llm.generate,
@@ -108,7 +115,8 @@ async def ask_json(req: AskReq, llm: LLM | None = None) -> AskResp:
         raise HTTPException(status_code=500, detail=f"LLM error: {e}") from e
 
     answer, sources = _normalize_answer(raw_answer, contexts)
-    print("LLM ANSWER:", answer, time.time() - started_at)
+    logger.info("LLM TIME: elapsed=%s)", time.time() - started_at)
+    logger.info("LLM ANSWER: %s", answer)
     return AskResp(answer=answer, sources=sources, used_context=contexts)
 
 
@@ -119,13 +127,15 @@ async def ask_stream(req: AskReq, llm: LLM | None = None) -> StreamingResponse:
                                  media_type="text/plain; charset=utf-8")
 
     llm = llm or get_llm()
+    if llm is None:
+        return StreamingResponse(iter(["Do not have llm"]),)
     return StreamingResponse(
         _stream_answer(llm, prompt, req, contexts, started_at),
         media_type="text/plain; charset=utf-8",
     )
 
 
-async def ask(req: AskReq, response_type: str) -> AskResp | StreamingResponse:
+async def ask(req: AskReq, response_type: str) -> StreamingResponse | AskResp | HTTPException:
     if response_type == "stream":
         return await ask_stream(req)
     if response_type == "json":

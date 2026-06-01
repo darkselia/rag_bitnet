@@ -8,10 +8,10 @@ from urllib.parse import urljoin, urldefrag
 import requests
 import tldextract
 from bs4 import BeautifulSoup
+from common.logger import get_logger
 
 
-def _log(message: str) -> None:
-    print(f"[site-format] {message}", flush=True)
+logger = get_logger("ingest")
 
 
 @dataclass(frozen=True)
@@ -126,19 +126,19 @@ def fetch_text(url: str, *, timeout: int, user_agent: str, content_types: Iterab
         r = requests.get(url, headers={"User-Agent": user_agent}, timeout=timeout)
         content_type = r.headers.get("Content-Type", "")
         expected = tuple(content_types)
-        _log(
+        logger.info(
             f"fetch url={url} status={r.status_code} "
             f"content_type={content_type!r} bytes={len(r.content)} expected={expected}"
         )
         if r.status_code != 200:
-            _log(f"skip url={url} reason=status_not_200")
+            logger.info(f"skip url={url} reason=status_not_200")
             return None
         if not any(t in content_type for t in expected):
-            _log(f"skip url={url} reason=unexpected_content_type")
+            logger.info(f"skip url={url} reason=unexpected_content_type")
             return None
         return r.text
     except Exception as e:
-        _log(f"fetch failed url={url} error={type(e).__name__}: {e}")
+        logger.info(f"fetch failed url={url} error={type(e).__name__}: {e}")
         return None
 
 
@@ -265,7 +265,7 @@ def json_to_documents(json_url: str, json_text: str) -> list[FormattedDocument]:
     try:
         data = json.loads(json_text)
     except json.JSONDecodeError as e:
-        _log(f"json parse failed url={json_url} error={e}")
+        logger.info(f"json parse failed url={json_url} error={e}")
         return []
 
     documents = []
@@ -281,7 +281,7 @@ def json_to_documents(json_url: str, json_text: str) -> list[FormattedDocument]:
             meta={"url": json_url, "record_id": record_id},
             stable_id=stable_id,
         ))
-    _log(f"json formatted url={json_url} documents={len(documents)}")
+    logger.info(f"json formatted url={json_url} documents={len(documents)}")
     return documents
 
 
@@ -296,22 +296,22 @@ def site_to_documents(
     visited_assets = set()
     queue = [base_url]
     documents: list[FormattedDocument] = []
-    _log(f"start base_url={base_url} max_pages={max_pages}")
+    logger.info(f"start base_url={base_url} max_pages={max_pages}")
 
     while queue and len(visited_pages) < max_pages:
         url = queue.pop(0)
         if url in visited_pages:
             continue
         visited_pages.add(url)
-        _log(f"page start url={url} visited_pages={len(visited_pages)} queue={len(queue)}")
+        logger.info(f"page start url={url} visited_pages={len(visited_pages)} queue={len(queue)}")
 
         html = fetch_text(url, timeout=timeout, user_agent=user_agent, content_types=("text/html",))
         if not html:
-            _log(f"page skip url={url} reason=no_html")
+            logger.info(f"page skip url={url} reason=no_html")
             continue
 
         text = html_to_text(html)
-        _log(f"page text url={url} html_chars={len(html)} text_chars={len(text)}")
+        logger.info(f"page text url={url} html_chars={len(html)} text_chars={len(text)}")
         if len(text) >= 200:
             documents.append(FormattedDocument(
                 text=text,
@@ -320,13 +320,13 @@ def site_to_documents(
                 meta={"url": url},
                 stable_id=f"site-html:{url}",
             ))
-            _log(f"page document added url={url}")
+            logger.info(f"page document added url={url}")
         else:
-            _log(f"page document skipped url={url} reason=text_too_short threshold=200")
+            logger.info(f"page document skipped url={url} reason=text_too_short threshold=200")
 
         page_links = discover_page_links(base_url, url, html)
         assets = discover_html_assets(base_url, url, html)
-        _log(f"page discovered url={url} links={len(page_links)} assets={len(assets)}")
+        logger.info(f"page discovered url={url} links={len(page_links)} assets={len(assets)}")
 
         for link in page_links:
             if link not in visited_pages and link not in queue:
@@ -336,7 +336,7 @@ def site_to_documents(
             if asset_url in visited_assets:
                 continue
             visited_assets.add(asset_url)
-            _log(f"asset start url={asset_url}")
+            logger.info(f"asset start url={asset_url}")
 
             if re.search(r"\.json(?:\?|$)", asset_url, re.I):
                 json_text = fetch_text(
@@ -348,9 +348,9 @@ def site_to_documents(
                 if json_text:
                     json_documents = json_to_documents(asset_url, json_text)
                     documents.extend(json_documents)
-                    _log(f"asset json added url={asset_url} documents={len(json_documents)}")
+                    logger.info(f"asset json added url={asset_url} documents={len(json_documents)}")
                 else:
-                    _log(f"asset json skipped url={asset_url} reason=no_text")
+                    logger.info(f"asset json skipped url={asset_url} reason=no_text")
                 continue
 
             if re.search(r"\.js(?:\?|$)", asset_url, re.I):
@@ -361,16 +361,16 @@ def site_to_documents(
                     content_types=("javascript", "ecmascript", "text/plain"),
                 )
                 if not js_text:
-                    _log(f"asset js skipped url={asset_url} reason=no_text")
+                    logger.info(f"asset js skipped url={asset_url} reason=no_text")
                     continue
 
                 json_urls = discover_json_urls_from_js(base_url, asset_url, js_text)
-                _log(f"asset js scanned url={asset_url} js_chars={len(js_text)} json_urls={len(json_urls)}")
+                logger.info(f"asset js scanned url={asset_url} js_chars={len(js_text)} json_urls={len(json_urls)}")
                 for json_url in json_urls:
                     if json_url in visited_assets:
                         continue
                     visited_assets.add(json_url)
-                    _log(f"js json start url={json_url} from={asset_url}")
+                    logger.info(f"js json start url={json_url} from={asset_url}")
                     json_text = fetch_text(
                         json_url,
                         timeout=timeout,
@@ -380,13 +380,13 @@ def site_to_documents(
                     if json_text:
                         json_documents = json_to_documents(json_url, json_text)
                         documents.extend(json_documents)
-                        _log(f"js json added url={json_url} documents={len(json_documents)}")
+                        logger.info(f"js json added url={json_url} documents={len(json_documents)}")
                     else:
-                        _log(f"js json skipped url={json_url} reason=no_text")
+                        logger.info(f"js json skipped url={json_url} reason=no_text")
             else:
-                _log(f"asset skipped url={asset_url} reason=unsupported_asset_type")
+                logger.info(f"asset skipped url={asset_url} reason=unsupported_asset_type")
 
-    _log(
+    logger.info(
         f"done base_url={base_url} pages={len(visited_pages)} "
         f"assets={len(visited_assets)} documents={len(documents)}"
     )

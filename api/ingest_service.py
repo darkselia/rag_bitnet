@@ -6,6 +6,9 @@ from starlette.concurrency import run_in_threadpool
 from api.schemas import IngestFilesReq, IngestSiteReq
 from rag import data_store
 from rag.ingest import ingest_folder, CrawlConfig, crawl_site
+from common.logger import get_logger
+
+logger = get_logger("api")
 
 
 async def ingest_files(req: IngestFilesReq) -> dict:
@@ -16,7 +19,7 @@ async def ingest_files(req: IngestFilesReq) -> dict:
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     finally:
-        print("INGEST FILES TIME:", time.time() - started_at)
+        logger.info("INGEST FILES TIME: %s", time.time() - started_at)
 
 
 async def ingest_site(req: IngestSiteReq) -> dict:

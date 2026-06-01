@@ -8,12 +8,15 @@ from rank_bm25 import BM25Okapi
 from common import config
 from common.text_utils import tokenize
 from rag.models import get_embed_model
+from common.logger import get_logger
 
 rows: List[Dict] = []
 corpus: List[str] = []
 index: Optional[faiss.IndexFlatIP] = None
 embeddings: Optional[np.ndarray] = None
 bm25: Optional[BM25Okapi] = None
+
+logger = get_logger("index")
 
 
 def _load_jsonl(path) -> List[Dict]:
@@ -32,7 +35,12 @@ def _norm_path(path: str) -> str:
     return path.replace("\\", "/")
 
 
+def _ensure_data_dir() -> None:
+    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def save_index() -> None:
+    _ensure_data_dir()
     _save_jsonl(config.CORPUS_JSONL, rows)
     if embeddings is not None:
         np.save(config.EMB_NPY, embeddings)
@@ -42,7 +50,7 @@ def save_index() -> None:
         try:
             faiss.write_index(index, str(config.FAISS_INDEX))
         except Exception as e:  # keep server alive on faiss write issues
-            print("faiss write warning:", e)
+            logger.warning("faiss write warning: %s", e)
     elif config.FAISS_INDEX.exists():
         config.FAISS_INDEX.unlink()
     with open(config.BM25_JSON, "w", encoding="utf-8") as f:
@@ -62,15 +70,15 @@ def load_index():
         try:
             index_obj = faiss.read_index(str(config.FAISS_INDEX))
         except Exception as e:
-            print("faiss load warning:", e)
+            logger.warning("faiss load warning: %s", e)
             index_obj = None
     else:
         index_obj = None
     if index_obj is not None and index_obj.ntotal != len(corpus):
-        print(f"faiss load warning: index size {index_obj.ntotal} != corpus size {len(corpus)}")
+        logger.warning("faiss load warning: index size %s != corpus size %s", index_obj.ntotal, len(corpus))
         index_obj = None
     if embeddings is not None and embeddings.shape[0] != len(corpus):
-        print(f"embeddings load warning: embeddings size {embeddings.shape[0]} != corpus size {len(corpus)}")
+        logger.warning("embeddings load warning: embeddings size %s != corpus size %s", embeddings.shape[0], len(corpus))
         embeddings = None
     index = index_obj
 
@@ -82,8 +90,12 @@ def load_index():
             if loaded_bm25_corpus and len(loaded_bm25_corpus) == len(corpus):
                 bm25_corpus = loaded_bm25_corpus
         except Exception as e:
-            print("bm25 load warning:", e)
-    bm25_tokens = [tokenize(c) for c in bm25_corpus]
+            logger.warning("bm25 load warning: %s", e)
+    bm25_tokens = []
+    for c in bm25_corpus:
+        tokens = tokenize(c)
+        if tokens:
+            bm25_tokens.append(tokens)
     bm25_obj = BM25Okapi(bm25_tokens) if bm25_tokens else None
     bm25 = bm25_obj
 
@@ -95,21 +107,20 @@ def rebuild_indices(batch_size: int = config.EMBED_BATCH) -> None:
     global corpus, embeddings, index, bm25
     rows[:] = [r for r in rows if r.get("text")]
     corpus = [r["text"] for r in rows]
-    print(f"[index] rebuilding indices for {len(corpus)} chunks", flush=True)
+    logger.info("[index] rebuilding indices for %s chunks", len(corpus))
     if not corpus:
         embeddings = None
         index = None
         bm25 = None
         save_index()
-        print("[index] saved empty indices", flush=True)
+        logger.info("[index] saved empty indices")
         return
 
     em = get_embed_model()
     encs = []
     for i in range(0, len(corpus), batch_size):
         batch = corpus[i:i + batch_size]
-        print(f"[index] embedding batch {i // batch_size + 1}/{(len(corpus) + batch_size - 1) // batch_size}",
-              flush=True)
+        logger.info("[index] embedding batch %s/%s", i // batch_size + 1, (len(corpus) + batch_size - 1) // batch_size)
         enc = em.encode(batch, batch_size=len(batch), show_progress_bar=False, normalize_embeddings=True)
         encs.append(enc)
     embeddings = np.vstack(encs).astype("float32")
@@ -119,9 +130,16 @@ def rebuild_indices(batch_size: int = config.EMBED_BATCH) -> None:
     cpu_index.add(embeddings)
     index = cpu_index
 
-    bm25 = BM25Okapi([tokenize(c) for c in corpus])
+    bm25_tokens = []
+    for c in corpus:
+        tokens = tokenize(c)
+        if tokens:
+            bm25_tokens.append(tokens)
+    bm25 = BM25Okapi(bm25_tokens) if bm25_tokens else None
+    if bm25 is None:
+        logger.info("[index] bm25 disabled: no indexable tokens in corpus")
     save_index()
-    print("[index] rebuild complete", flush=True)
+    logger.info("[index] rebuild complete")
 
 
 def remove_chunks_by_paths(paths: set[str]) -> int:

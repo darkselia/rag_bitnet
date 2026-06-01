@@ -8,7 +8,7 @@ _STOPWORDS = {
 
 
 def tokenize(text: str) -> List[str]:
-    return re.findall(r"[a-z0-9]+", text.lower())
+    return re.findall(r"[^\W_]+", text.lower(), flags=re.UNICODE)
 
 
 def query_terms(query: str) -> List[str]:

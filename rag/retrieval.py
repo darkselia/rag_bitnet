@@ -63,7 +63,7 @@ def retrieve(query: str, k_vec: int = 8, k_bm25: int = 8, k_final: int = 6, sim_
              sources: Optional[List[str]] = None, site_domain: Optional[str] = None) -> List[Dict]:
     if k_final <= 0:
         return []
-    if data_store.index is None or data_store.bm25 is None or len(data_store.corpus) == 0:
+    if data_store.index is None or len(data_store.corpus) == 0:
         return []
 
     allowed_ids = _allowed_indices(sources, site_domain)
@@ -92,18 +92,19 @@ def retrieve(query: str, k_vec: int = 8, k_bm25: int = 8, k_final: int = 6, sim_
         if len(vec_ranked) >= k_vec:
             break
 
-    bm_scores = data_store.bm25.get_scores(tokenize(query))
     bm_ranked = []
-    bm_pool = max(k_bm25, k_final * 20, config.CROSS_RERANKER_TOPK * 3)
-    for i in np.argsort(bm_scores)[::-1]:
-        if bm_scores[i] <= 0:
-            break
-        if allowed_ids is not None and i not in allowed_ids:
-            continue
-        bm_ranked.append(int(i))
-        if len(bm_ranked) >= bm_pool:
-            break
-    bm_ranked = bm_ranked[:k_bm25]
+    if data_store.bm25 is not None:
+        bm_scores = data_store.bm25.get_scores(tokenize(query))
+        bm_pool = max(k_bm25, k_final * 20, config.CROSS_RERANKER_TOPK * 3)
+        for i in np.argsort(bm_scores)[::-1]:
+            if bm_scores[i] <= 0:
+                break
+            if allowed_ids is not None and i not in allowed_ids:
+                continue
+            bm_ranked.append(int(i))
+            if len(bm_ranked) >= bm_pool:
+                break
+        bm_ranked = bm_ranked[:k_bm25]
 
     fused_scores = _rrf_scores(vec_ranked, bm_ranked)
     if not fused_scores:

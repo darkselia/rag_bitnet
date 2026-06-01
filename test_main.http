@@ -27,9 +27,7 @@ Content-Type: application/json
 
 
 ### RAG вопрос только по локальным документам
-# curl -X POST "http://127.0.0.1:8000/ask" \
-#   -H "Content-Type: application/json" \
-#   -d '{"query":"This famous question and answer come from the Brothers Grimm fairy tale Snow White.?","sources":["docs"],"top_k":6,"temperature":0.2}'
+# curl -X POST "http://127.0.0.1:8000/ask" -H "Content-Type: application/json" -d '{"query":"In what order did the bun visit the animals?","sources":["docs"],"top_k":6,"temperature":0.2}'
 # @timeout 600
 POST http://127.0.0.1:8000/ask
 Content-Type: application/json

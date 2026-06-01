@@ -7,10 +7,14 @@ from pydantic import BaseModel
 
 from rag import data_store
 from common.formatters import file_to_document, site_to_documents
+from common.logger import get_logger
+
+
+logger = get_logger("ingest")
 
 
 def _log_site(message: str) -> None:
-    print(f"[ingest.site] {message}", flush=True)
+    logger.info(message)
 
 
 def _stored_path(path: Path) -> str:
