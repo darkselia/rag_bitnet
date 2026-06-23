@@ -3,10 +3,10 @@ import time
 from fastapi import HTTPException
 from starlette.concurrency import run_in_threadpool
 
-from api.schemas import IngestFilesReq, IngestSiteReq
+from common.logger import get_logger
 from rag import data_store
 from rag.ingest import ingest_folder, CrawlConfig, crawl_site
-from common.logger import get_logger
+from schemas.app_schema import IngestFilesReq, IngestSiteReq
 
 logger = get_logger("api")
 

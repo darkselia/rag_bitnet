@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator
 
 from common import config
+from schemas.app_schema import LLMResp, Message
 
 
 class LLM(ABC):
@@ -10,16 +11,23 @@ class LLM(ABC):
         pass
 
     @abstractmethod
-    def generate(self, prompt: str, max_tokens: int | None = None, temperature: float | None = None) -> str:
+    def generate(
+            self,
+            messages: list[Message],
+            max_tokens: int | None = None,
+            temperature: float | None = None,
+            context: str = "",
+    ) -> LLMResp:
         pass
 
     @abstractmethod
     def generate_stream(
-        self,
-        prompt: str,
-        max_tokens: int | None = None,
-        temperature: float | None = None,
-    ) -> Iterator[str]:
+            self,
+            messages: list[Message],
+            max_tokens: int | None = None,
+            temperature: float | None = None,
+            context: str = "",
+    ) -> Iterator[LLMResp]:
         pass
 
 

@@ -1,6 +1,7 @@
 import os
 import time
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 
@@ -89,6 +90,14 @@ RERANKER_BATCH = _env_int("RERANKER_BATCH", 16, min_value=1)
 LLM_PROVIDER = _env_str("LLM_PROVIDER", "BITNET").lower()
 LLM_MAX_TOKENS = _env_int("LLM_MAX_TOKENS", 300, min_value=1)
 LLM_TEMPERATURE = _env_float("LLM_TEMPERATURE", 0.6, min_value=0.0, max_value=2.0)
+SYSTEM_PROMPT: str = _env_str("SYSTEM_PROMPT", "You are a helpful AI assistant.")
+
+_raw_bitnet_mode = _env_str("BITNET_MODE", "chat").lower()
+if _raw_bitnet_mode not in ("chat", "completion"):
+    raise ValueError(
+        f"BITNET_MODE must be 'chat' or 'completion', got: {_raw_bitnet_mode!r}"
+    )
+BITNET_MODE: Literal["chat", "completion"] = _raw_bitnet_mode
 
 BITNET_HOST = _env_str("BITNET_HOST", "127.0.0.1")
 BITNET_PORT = _env_int("BITNET_PORT", 8080, min_value=1)

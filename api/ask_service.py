@@ -6,11 +6,11 @@ from fastapi import HTTPException
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import StreamingResponse
 
-from api.schemas import AskReq, AskResp
 from clients.llm import LLM, get_llm
 from common import config
-from rag.prompt import build_prompt
 from common.logger import get_logger
+from rag.prompt import build_prompt
+from schemas.app_schema import AskReq, AskResp
 
 logger = get_logger("api")
 
