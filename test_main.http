@@ -26,8 +26,8 @@ Content-Type: application/json
 }
 
 
-### RAG вопрос только по локальным документам (JSON)
-# curl -X POST "http://127.0.0.1:8000/ask" -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"In what order did the bun visit the animals?"}],"sources":["rag_docs"],"top_k":6,"temperature":0.5,"stream":false}'
+### RAG вопрос
+# curl -N -X POST "http://127.0.0.1:8000/ask" -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"What the kolobok said to wolf?"}],"sources":["rag_docs"],"top_k":6,"temperature":0.4,"stream":true}'
 # @timeout 600
 POST http://127.0.0.1:8000/ask
 Content-Type: application/json
@@ -36,29 +36,7 @@ Content-Type: application/json
   "messages": [
     {
       "role": "user",
-      "content": "In what order did the kolobok visit the animals?"
-    }
-  ],
-  "sources": [
-    "docs"
-  ],
-  "top_k": 6,
-  "temperature": 0.5,
-  "stream": true
-}
-
-
-### RAG вопрос — стриминг
-# curl -N -X POST "http://127.0.0.1:8000/ask" -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"What bun said to wolf?"}],"sources":["rag_docs"],"top_k":6,"temperature":0.4,"stream":true}'
-# @timeout 600
-POST http://127.0.0.1:8000/ask
-Content-Type: application/json
-
-{
-  "messages": [
-    {
-      "role": "user",
-      "content": "What bun said to wolf?"
+      "content": "What the Kolobok said to wolf?"
     }
   ],
   "sources": [
@@ -92,30 +70,6 @@ Content-Type: application/json
   "temperature": 0.4,
   "stream": false
 }
-
-
-### RAG вопрос с кастомным system prompt в начале messages
-# curl -X POST "http://127.0.0.1:8000/ask" -H "Content-Type: application/json" -d '{"messages":[{"role":"system","content":"Отвечай кратко, максимум 2 предложения."},{"role":"user","content":"What is RAG?"}],"top_k":6,"max_tokens":200,"stream":false}'
-# @timeout 600
-POST http://127.0.0.1:8000/ask
-Content-Type: application/json
-
-{
-  "messages": [
-    {
-      "role": "system",
-      "content": "Отвечай кратко, максимум 2 предложения."
-    },
-    {
-      "role": "user",
-      "content": "What is RAG?"
-    }
-  ],
-  "top_k": 6,
-  "max_tokens": 200,
-  "stream": false
-}
-
 
 ### Прямой запрос к BitNet completion без retrieval и без локального RAG контекста сервера
 # curl -N -X POST "http://127.0.0.1:8080/completion" \

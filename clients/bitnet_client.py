@@ -7,6 +7,7 @@ import requests
 
 from clients.llm import LLM
 from common import config
+from common.logger import get_logger
 from schemas.app_schema import LLMResp, Message, Timings
 from schemas.bitnet_schema import (
     ChatCompletionChunk,
@@ -23,10 +24,14 @@ _env = jinja2.Environment(
 )
 _completion_template = _env.get_template("completion_chat_template.jinja")
 
+logger = get_logger("bitnet_client")
+
 
 def _render_prompt(messages: list[Message]) -> str:
     dicts = [m.model_dump() for m in messages]
-    return _completion_template.render(messages=dicts, add_generation_prompt=True)
+    result = _completion_template.render(messages=dicts, add_generation_prompt=True)
+    logger.info(f"build_user_message: {result}")
+    return result
 
 
 def _build_user_message(messages: list[Message], context: str) -> list[Message]:
@@ -42,11 +47,23 @@ def _build_user_message(messages: list[Message], context: str) -> list[Message]:
                     f"Question: {question}\n"
                 ),
             )
+            logger.info(f"build_user_message: {result[i]}")
             break
     return result
 
 
-def _compute_chat_timings(usage, elapsed_ms: float) -> Timings:
+def _compute_chat_timings(usage, elapsed_ms: float, model) -> Timings:
+    if usage is None:
+        return Timings(
+            prompt_n=0,
+            prompt_ms=0,
+            prompt_per_token_ms=0,
+            prompt_per_second=0,
+            predicted_n=0,
+            predicted_ms=0,
+            predicted_per_token_ms=0,
+            predicted_per_second=0,
+        )
     prompt_n = usage.prompt_tokens
     predicted_n = usage.completion_tokens
     total_n = prompt_n + predicted_n
@@ -126,11 +143,12 @@ class BitNetAPI(LLM):
         resp.raise_for_status()
         elapsed_ms = (time.monotonic() - start) * 1000
         data = ChatCompletionResponse.model_validate(resp.json())
-        timings = _compute_chat_timings(data.usage, elapsed_ms) if data.usage else None
+        timings = _compute_chat_timings(data.usage, elapsed_ms, data.model) if data.usage else None
         return LLMResp(
             id=data.id,
             content=data.choices[0].message.content,
             timings=timings,
+            model=data.model,
         )
 
     def _generate_completion(
@@ -157,6 +175,7 @@ class BitNetAPI(LLM):
             id=str(data.index),
             content=data.content,
             timings=timings,
+            model=data.model,
         )
 
     def _generate_chat_stream(
@@ -177,6 +196,7 @@ class BitNetAPI(LLM):
         content_pieces: list[str] = []
         response_id = ""
         usage = None
+        model = ""
         with requests.post(self._url, json=payload, timeout=self.timeout, stream=True) as resp:
             resp.raise_for_status()
             resp.encoding = "utf-8"
@@ -199,7 +219,9 @@ class BitNetAPI(LLM):
                 piece = chunk.choices[0].delta.content or ""
                 if piece:
                     content_pieces.append(piece)
-                    yield LLMResp(id=chunk.id, content=piece)
+                    yield LLMResp(id=chunk.id, content=piece, model=chunk.model or "")
+                if chunk.model:
+                    model = chunk.model
                 if chunk.usage:
                     usage = chunk.usage
                 if chunk.id:
@@ -208,7 +230,7 @@ class BitNetAPI(LLM):
                     break
         elapsed_ms = (time.monotonic() - start) * 1000
         timings = _compute_chat_timings(usage, elapsed_ms) if usage else None
-        yield LLMResp(id=response_id, content="".join(content_pieces), timings=timings)
+        yield LLMResp(id=response_id, content="".join(content_pieces), timings=timings, model=model)
 
     def _generate_completion_stream(
             self,
@@ -228,6 +250,7 @@ class BitNetAPI(LLM):
         }
         content_pieces: list[str] = []
         final_data = None
+        model = ""
         with requests.post(self._url, json=payload, timeout=self.timeout, stream=True) as resp:
             resp.raise_for_status()
             resp.encoding = "utf-8"
@@ -255,7 +278,8 @@ class BitNetAPI(LLM):
             try:
                 full = CompletionResponse.model_validate_json(final_data)
                 timings = full.timings if full.timings else None
-                yield LLMResp(id=str(full.index), content="".join(content_pieces), timings=timings)
+                model = full.model
+                yield LLMResp(id=str(full.index), content="".join(content_pieces), timings=timings, model=model)
             except Exception:
                 yield LLMResp(content="".join(content_pieces))
         elif content_pieces:

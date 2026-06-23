@@ -1,4 +1,6 @@
+import csv
 import logging
+import threading
 from pathlib import Path
 
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
@@ -78,3 +80,45 @@ def get_console_logger(name: str) -> logging.Logger:
         logger._console_handler_added = True  # type: ignore[attr-defined]
     return logger
 
+
+class CsvLogger:
+    def __init__(self, name: str, fieldnames: list[str] | None = None, key: str | None = None):
+        self._path = LOG_DIR / f"{name}.csv"
+        self._lock = threading.Lock()
+        self._fieldnames: list[str] | None = fieldnames
+        self._key = key
+
+    def log(self, row: dict) -> None:
+        with self._lock:
+            if self._fieldnames is None:
+                self._fieldnames = list(row.keys())
+            else:
+                for k in row:
+                    if k not in self._fieldnames:
+                        raise ValueError(
+                            f"CsvLogger: unknown key {k!r}. "
+                            f"Known fieldnames: {self._fieldnames}"
+                        )
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+            if self._key and self._key in row and self._path.exists() and self._path.stat().st_size > 0:
+                key_val = row[self._key]
+                with open(self._path, "r", newline="", encoding="utf-8") as f:
+                    all_rows = list(csv.DictReader(f, delimiter=';'))
+
+                if all_rows:
+                    for i, r in enumerate(all_rows):
+                        if r.get(self._key) == key_val:
+                            all_rows[i] = {**r, **row}
+                            with open(self._path, "w", newline="", encoding="utf-8") as f:
+                                w = csv.DictWriter(f, fieldnames=self._fieldnames, delimiter=';')
+                                w.writeheader()
+                                w.writerows(all_rows)
+                            return
+
+            exists = self._path.exists() and self._path.stat().st_size > 0
+            with open(self._path, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=self._fieldnames, delimiter=';')
+                if not exists:
+                    w.writeheader()
+                w.writerow(row)

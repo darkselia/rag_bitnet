@@ -58,3 +58,4 @@ class LLMResp(BaseModel):
     id: str = ""
     content: str
     timings: Optional[Timings] = None
+    model: str = ""
