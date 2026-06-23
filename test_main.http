@@ -1,13 +1,13 @@
 ### Ингест локальных TXT/MD файлов из папки docs с заменой уже проиндексированных чанков этих файлов
 # curl -X POST "http://127.0.0.1:8000/ingest/files" \
 #   -H "Content-Type: application/json" \
-#   -d '{"folder":"./docs","replace_existing":true}'
+#   -d '{"folder":"./rag_docs","replace_existing":true}'
 # @timeout 600
 POST http://127.0.0.1:8000/ingest/files
 Content-Type: application/json
 
 {
-  "folder": "./docs",
+  "folder": "./data/rag_docs",
   "replace_existing": true
 }
 
@@ -26,56 +26,94 @@ Content-Type: application/json
 }
 
 
-### RAG вопрос только по локальным документам
-# curl -X POST "http://127.0.0.1:8000/ask" -H "Content-Type: application/json" -d '{"query":"In what order did the bun visit the animals?","sources":["docs"],"top_k":6,"temperature":0.2}'
+### RAG вопрос только по локальным документам (JSON)
+# curl -X POST "http://127.0.0.1:8000/ask" -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"In what order did the bun visit the animals?"}],"sources":["rag_docs"],"top_k":6,"temperature":0.5,"stream":false}'
 # @timeout 600
 POST http://127.0.0.1:8000/ask
 Content-Type: application/json
 
 {
-  "query": "In what order did the bun visit the animals?",
+  "messages": [
+    {
+      "role": "user",
+      "content": "In what order did the kolobok visit the animals?"
+    }
+  ],
   "sources": [
     "docs"
   ],
   "top_k": 6,
-  "temperature": 0.5
+  "temperature": 0.5,
+  "stream": true
 }
 
-### RAG вопрос по локальным документам и сайту с ограничением site_domain
-# curl -X POST "http://127.0.0.1:8000/ask" \
-#   -H "Content-Type: application/json" \
-#   -d '{"query":"О чем твоя база данных","sources":["docs","site"],"site_domain":"example.com","top_k":6,"temperature":0.4}'
+
+### RAG вопрос — стриминг
+# curl -N -X POST "http://127.0.0.1:8000/ask" -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"What bun said to wolf?"}],"sources":["rag_docs"],"top_k":6,"temperature":0.4,"stream":true}'
 # @timeout 600
 POST http://127.0.0.1:8000/ask
 Content-Type: application/json
 
 {
-  "query": "What bun said to wolf?",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What bun said to wolf?"
+    }
+  ],
+  "sources": [
+    "docs"
+  ],
+  "top_k": 6,
+  "temperature": 0.4,
+  "stream": true
+}
+
+
+### RAG вопрос по локальным документам и сайту с site_domain
+# curl -X POST "http://127.0.0.1:8000/ask" -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"О чем твоя база данных"}],"sources":["rag_docs","site"],"site_domain":"example.com","top_k":6,"temperature":0.4,"stream":false}'
+# @timeout 600
+POST http://127.0.0.1:8000/ask
+Content-Type: application/json
+
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "О чем твоя база данных"
+    }
+  ],
   "sources": [
     "docs",
     "site"
   ],
   "site_domain": "example.com",
   "top_k": 6,
-  "temperature": 0.4
+  "temperature": 0.4,
+  "stream": false
 }
 
 
-### RAG потоковый ответ через /ask?type=stream только по локальным документам
-# curl -N -X POST "http://127.0.0.1:8000/ask?type=stream" \
-#   -H "Content-Type: application/json" \
-#   -d '{"query":"2+2=","sources":["docs"],"top_k":6,"temperature":0.2}'
+### RAG вопрос с кастомным system prompt в начале messages
+# curl -X POST "http://127.0.0.1:8000/ask" -H "Content-Type: application/json" -d '{"messages":[{"role":"system","content":"Отвечай кратко, максимум 2 предложения."},{"role":"user","content":"What is RAG?"}],"top_k":6,"max_tokens":200,"stream":false}'
 # @timeout 600
-POST http://127.0.0.1:8000/ask?type=stream
+POST http://127.0.0.1:8000/ask
 Content-Type: application/json
 
 {
-  "query": "What bun said to wolf?",
-  "sources": [
-    "docs"
+  "messages": [
+    {
+      "role": "system",
+      "content": "Отвечай кратко, максимум 2 предложения."
+    },
+    {
+      "role": "user",
+      "content": "What is RAG?"
+    }
   ],
   "top_k": 6,
-  "temperature": 0.2
+  "max_tokens": 200,
+  "stream": false
 }
 
 

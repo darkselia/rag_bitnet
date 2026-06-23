@@ -77,7 +77,7 @@ def _env_path(name: str, default: str) -> Path:
     return (PROJECT_ROOT / value).resolve()
 
 
-DATA_DIR = _env_path("DATA_DIR", "./data")
+DATA_DIR = _env_path("DATA_DIR", "./data/vector_store")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 EMBED_MODEL = _env_str("EMBED_MODEL", "intfloat/multilingual-e5-base")

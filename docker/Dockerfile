@@ -26,7 +26,7 @@ COPY docker/start_services.sh /usr/local/bin/start_services.sh
 RUN chmod +x /usr/local/bin/start_services.sh
 
 RUN mkdir -p /app/data
-VOLUME ["/app/data", "/opt/bitnet"]
+VOLUME ["/app/data/vector_store", "/opt/bitnet"]
 
 EXPOSE 8000 8080
 CMD ["/usr/local/bin/start_services.sh"]
