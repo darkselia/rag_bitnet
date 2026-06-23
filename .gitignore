@@ -1,9 +1,9 @@
 .idea
 .env
 .env.local
+.opencode/
 __pycache__/
 *.pyc
-docs/
-data/
 *_old.*
 logs/
+data/

@@ -247,7 +247,7 @@ class BitNetAPI(LLM):
                     continue
                 if chunk.content:
                     content_pieces.append(chunk.content)
-                    yield LLMResp(content=chunk.content)
+                    yield LLMResp(id=str(chunk.index), content=chunk.content)
                 if chunk.stop:
                     final_data = data_part
                     break

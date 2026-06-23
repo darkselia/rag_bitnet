@@ -1,7 +1,7 @@
-from fastapi import APIRouter, Query
+from fastapi import APIRouter
 
 from api import ask_service, ingest_service
-from api.schemas import AskReq, IngestFilesReq, IngestSiteReq
+from schemas.app_schema import AskReq, IngestFilesReq, IngestSiteReq
 
 router = APIRouter()
 
@@ -17,5 +17,5 @@ async def ingest_site(req: IngestSiteReq):
 
 
 @router.post("/ask")
-async def ask(req: AskReq, response_type: str = Query(default="json", alias="type")):
-    return await ask_service.ask(req, response_type)
+async def ask(req: AskReq):
+    return await ask_service.ask(req)
