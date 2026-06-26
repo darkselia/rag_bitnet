@@ -53,7 +53,7 @@ RAG-вопрос. Сервер ищет релевантный контекст 
   "messages": [
     {
       "role": "user",
-      "content": "What bun said to wolf?"
+      "content": "What the kolobok said to wolf?"
     }
   ],
   "stream": false,
@@ -62,7 +62,7 @@ RAG-вопрос. Сервер ищет релевантный контекст 
     "site"
   ],
   "top_k": 6,
-  "temperature": 0.6
+  "temperature": 0.4
 }
 ```
 
@@ -89,7 +89,12 @@ RAG-вопрос. Сервер ищет релевантный контекст 
   },
   "timings": {
     "prompt_n": 1112,
+    "prompt_ms": 1234.567,
+    "prompt_per_token_ms": 1.11,
+    "prompt_per_second": 900.0,
     "predicted_n": 22,
+    "predicted_ms": 3273.456,
+    "predicted_per_token_ms": 148.79,
     "predicted_per_second": 6.72
   },
   "used_context": [
@@ -115,14 +120,14 @@ RAG-вопрос. Сервер ищет релевантный контекст 
 Каждая строка — валидный JSON (`application/x-ndjson`).
 
 ```jsonlines
-{"content": "Kolobok"}
-{"content": " visited"}
-{"content": " the"}
+{"id": "", "content": "Kolobok", "model": ""}
+{"id": "", "content": " visited", "model": ""}
+{"id": "", "content": " the", "model": ""}
 ...
-{"id": "chatcmpl-xxx", "answer": {"role": "assistant", "content": "Kolobok visited the ..."}, "timings": {"prompt_n": 1112, ...}, "used_context": [...]}
+{"id": "chatcmpl-xxx", "content": "", "timings": {...}, "model": "BitNet-b1.58-2B-4T", "answer": {"role": "assistant", "content": "Kolobok visited the ..."}, "used_context": [...]}
 ```
 
 Поток состоит из:
 
-1. **Чанки контента** — `{"content": "..."}` — по одному токену/слову.
-2. **Финальный JSON** — полный `AskResp` с `id`, `answer`, `timings` и `used_context`.
+1. **Чанки контента** — `{"id": "", "content": "...", "model": ""}` — по одному токену/слову.
+2. **Финальный JSON** — полный `AskResp` с `id`, `answer`, `timings`, `model` и `used_context`.

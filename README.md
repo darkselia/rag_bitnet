@@ -10,13 +10,15 @@ FastAPI-сервис для RAG-чата поверх локальных док�
 - Гибридный retrieval: dense embeddings (sentence-transformers) + BM25 + опциональный cross-encoder reranker.
 - Два режима LLM: **chat** (`/v1/chat/completions`) и **completion** (`/completion`) — переключаются через
   `BITNET_MODE`.
-- JSON и ndjson-streaming ответы через `/ask`.
+- JSON и ndjson-streaming ответы через `/ask` (поток из чанков + финальный `AskResp`).
+- CSV-логирование всех RAG-запросов с таймингами retrieve/LLM.
 
 ## Быстрый старт
 
 ```bash
 cp .env.example .env
-pip install -r requirements.txt
+pip install -r requirements.txt        # RAG API
+pip install -r requirements-bench.txt  # + benchmarks (опционально)
 python main.py || uvicorn api.server:app --host 0.0.0.0 --port 8000
 ```
 
@@ -58,11 +60,13 @@ docker run --rm -p 8000:8000 -p 8080:8080 \
 
 ```
 api/           FastAPI routes, services, server
-clients/       LLM abstraction + BitNet client
-common/        Config, logger, utils, file/HTML formatters
+clients/       LLM abstraction + BitNet client (+ Jinja2 template)
+common/        Config, logger (CsvLogger), utils, file/HTML formatters
 rag/           Ingestion, retrieval, data store
-schemas/       Pydantic models (app + BitNet API)
-docs/          Документация проекта
+schemas/       Pydantic models (app schemas + BitNet API schemas)
+docs/          Документация проекта (в т.ч. docs/benchmarks.md)
+benchmarks/    lm-eval harness адаптеры и раннеры бенчмарков
+logs/          CSV-логи запросов, benchmark results
 data/rag_docs/      Исходные файлы для индексации (.txt, .md, .pdf)
 data/vector_store/  FAISS + BM25 индексы, rows.jsonl, embeddings.npy
 ```
@@ -75,9 +79,14 @@ data/vector_store/  FAISS + BM25 индексы, rows.jsonl, embeddings.npy
 
 - `BITNET_MODE` — режим LLM: `chat` или `completion`
 - `LLM_PROVIDER` — `bitnet`
-- `SYSTEM_PROMPT` — системный промпт для rag
+- `SYSTEM_PROMPT` — системный промпт для RAG
 - `BITNET_HOST`, `BITNET_PORT` — адрес BitNet inference server
+- `DATA_DIR` — директория хранения индексов (по умолч. `./data/vector_store`)
 
 ## Зависимости
 
-Перечислены в `requirements.txt`. Ключевые: FastAPI, Pydantic, sentence-transformers, FAISS, Jinja2, requests.
+| Файл                     | Назначение                                                                                            |
+|--------------------------|-------------------------------------------------------------------------------------------------------|
+| `requirements.txt`       | RAG API: FastAPI, Pydantic, sentence-transformers, FAISS, Jinja2, rank-bm25, requests                 |
+| `requirements-bench.txt` | Бенчмарки: `-r requirements.txt` + lm-eval, datasets, bert-score, rouge-score, bleurt, tensorflow-cpu |
+| `requirements_full.txt`  | Полный frozen-слепок всех зависимостей (воспроизводимое окружение)                                    |

@@ -12,7 +12,10 @@ User Request
      │                                      context chunks
      │                                              │
      ▼                                              ▼
-  LLM.generate(messages, context) ◄──── _build_user_message()
+   LLM.generate(messages, context) ◄──── _build_user_message()
+      │
+      ▼
+   CsvLogger (логирование в .csv с таймингами)
      │
      ▼
   BitNetAPI ──► HTTP POST ──► BitNet inference server
@@ -69,8 +72,39 @@ class LLMResp(BaseModel):
     id: str = ""
     content: str
     timings: Optional[Timings] = None
+    model: str = ""
 ```
 
 - `content` — текст (в стриме — один токен/слово, в последнем чанке — полный ответ).
 - `id` — идентификатор ответа (chat-completion id или id_slot).
 - `timings` — метрики производительности (только в последнем чанке стрима или в JSON-ответе).
+- `model` — имя модели из ответа сервера.
+
+## Timings
+
+```python
+class Timings(BaseModel):
+  prompt_n: int
+  prompt_ms: float
+  prompt_per_token_ms: float
+  prompt_per_second: float
+  predicted_n: int
+  predicted_ms: float
+  predicted_per_token_ms: float
+  predicted_per_second: float
+```
+
+## CsvLogger
+
+Каждый RAG-запрос логируется в `logs/ask_service.csv` через потокобезопасный `CsvLogger`.
+Поддерживает обновление строки по ключу (используется `timestamp`): сначала пишется строка с retrieve-полями,
+затем при ответе LLM она дополняется LLM-полями.
+
+## CsvLogger
+
+```python
+class CsvLogger:
+  def __init__(self, name: str, fieldnames: list[str] | None = None, key: str | None = None)
+
+    def log(self, row: dict) -> None
+```

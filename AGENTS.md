@@ -8,21 +8,31 @@
 - Показывать diff файлов, чтобы они отображались в IDE.
 - Коммиты должны быть атомарными и описательными с использованием правил Conventional commits.
 
+## Файлы зависимостей
+
+| Файл                     | Назначение                                                                 |
+|--------------------------|----------------------------------------------------------------------------|
+| `requirements.txt`       | RAG API: FastAPI, Pydantic, sentence-transformers, FAISS, Jinja2, requests |
+| `requirements-bench.txt` | Бенчмарки: `-r requirements.txt` + lm-eval, datasets, метрики              |
+| `requirements_full.txt`  | Полный frozen-слепок всех зависимостей (воспроизводимое окружение)         |
+
 ## Ключевые файлы и их роль
 
-| Файл                       | Назначение                                                                                                                                        |
-|----------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------|
-| `api/routes.py`            | Все HTTP-роуты. Добавлять новые эндпоинты здесь.                                                                                                  |
-| `api/ask_service.py`       | Оркестрация RAG-пайплайна.                                                                                                                        |
-| `rag/ingest.py`            | Функции для индексации файлов и сайтов.                                                                                                           |
-| `rag/retrieve.py`          | Функции для извлечения релевантного контекста (FAISS + BM25 + reranker).                                                                          |
-| `api/ingest_service.py`    | Логика обработки запросов на индексацию.                                                                                                          |
-| `clients/llm.py`           | Абстрактный класс LLM. Сигнатуры: `generate(messages, max_tokens, temperature, context) -> LLMResp`, `generate_stream(...) -> Iterator[LLMResp]`. |
-| `clients/bitnet_client.py` | Реализация BitNet. Два режима: `chat` и `completion`. Внутренние методы `_generate_chat*` / `_generate_completion*`.                              |
-| `schemas/app_schema.py`    | Pydantic-схемы приложения: `Message`, `LLMReq`, `LLMResp`, `Timings`, `AskResp`.                                                                  |
-| `schemas/bitnet_schema.py` | Схемы ответов BitNet API: `ChatCompletionChunk`, `CompletionResponse`, `CompletionStreamChunk`.                                                   |
-| `common/config.py`         | Конфигурация из env. Добавлять новые переменные через `_env_str/_env_int` и т.д.                                                                  |
-| `common/logger.py`         | Настройка логирования. Использовать `get_logger(name)`.                                                                                           |
+| Файл                                     | Назначение                                                                                                                                                  |
+|------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `api/routes.py`                          | Все HTTP-роуты. Добавлять новые эндпоинты здесь.                                                                                                            |
+| `api/ask_service.py`                     | Оркестрация RAG-пайплайна с CSV-логированием запросов.                                                                                                      |
+| `api/ingest_service.py`                  | Логика обработки запросов на индексацию.                                                                                                                    |
+| `rag/ingest.py`                          | Функции для индексации файлов и сайтов.                                                                                                                     |
+| `rag/retrieval.py`                       | Функции для извлечения релевантного контекста (FAISS + BM25 + reranker).                                                                                    |
+| `rag/data_store.py`                      | Слой персистентности: загрузка/сохранение индексов, rows.jsonl, BM25-корпус, перестройка индексов.                                                          |
+| `clients/llm.py`                         | Абстрактный класс LLM. Сигнатуры: `generate(messages, max_tokens, temperature, context) -> LLMResp`, `generate_stream(...) -> Iterator[LLMResp]`.           |
+| `clients/bitnet_client.py`               | Реализация BitNet. Два режима: `chat` и `completion`. Внутренние методы `_generate_chat*` / `_generate_completion*`.                                        |
+| `clients/completion_chat_template.jinja` | Jinja2-шаблон для рендеринга промпта в completion-режиме.                                                                                                   |
+| `schemas/app_schema.py`                  | Pydantic-схемы приложения: `Message`, `LLMReq`, `LLMResp`, `Timings`, `AskReq`, `AskResp`, `IngestFilesReq`, `IngestSiteReq`.                               |
+| `schemas/bitnet_schema.py`               | Схемы ответов BitNet API: `ChatCompletionChunk`, `ChatCompletionResponse`, `CompletionResponse`, `CompletionStreamChunk`, `Usage`, `GenerationSettings`.    |
+| `common/config.py`                       | Конфигурация из env. Добавлять новые переменные через `_env_str/_env_int` и т.д. Поддерживает `SYSTEM_PROMPT` и валидацию `BITNET_MODE`.                    |
+| `common/logger.py`                       | Настройка логирования (`get_logger(name)`, `get_console_logger(name)`) + `CsvLogger` для записи CSV-логов с потокобезопасной вставкой/обновлением по ключу. |
 
 ## Правила написания кода
 
