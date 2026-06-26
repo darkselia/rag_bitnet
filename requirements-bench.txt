@@ -1,0 +1,13 @@
+-r requirements.txt
+
+lm-eval>=0.4.7
+langdetect>=1.0.9
+immutabledict>=4.3.1
+bert-score>=0.3.13
+datasets>=2.16.0
+rouge-score>=0.1.2
+nltk>=3.9.4
+absl-py>=2.4.0
+evaluate>=0.4.0
+tensorflow-cpu>=2.15.0
+bleurt @ git+https://github.com/google-research/bleurt.git
