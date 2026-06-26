@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import time
 
+from benchmarks import run_mmlu_prox_ru
 from benchmarks.run_ifeval import run as run_ifeval
 from benchmarks.run_meddialog import run as run_meddialog
 from benchmarks.run_medqa import run as run_medqa
@@ -12,8 +13,9 @@ from benchmarks.run_mmlu_pro import run as run_mmlu_pro
 def run_all(limit: int | None = None, model: str | None = None, stub: bool = False):
     runners = [
         ("MMLU-Pro", run_mmlu_pro),
+        ("MMLU-Prox-ru", run_mmlu_prox_ru),
         ("IFEval", run_ifeval),
-        ("MedDialog", run_meddialog),
+        # ("MedDialog", run_meddialog),
         ("MedQA", run_medqa),
     ]
 

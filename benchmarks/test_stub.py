@@ -15,6 +15,7 @@ def run(limit: int | None = None) -> None:
     tasks_run = {
         "medqa": ["medqa_4options"],
         "mmlu_pro": ["mmlu_pro_math"],
+        "mmlu_prox_ru": ["mmlu_prox_ru_health"],
         "ifeval": ["ifeval"],
     }
 

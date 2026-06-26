@@ -42,12 +42,25 @@ class StubLM(LM):
             else:
                 gold = self._get_gold_letter(doc)
                 category = doc.get("category", "general")
-                generated = (
-                    f"We refer to Wikipedia articles on {category}"
-                    f" for help. The answer is ({gold})."
+                is_russian = (
+                    req.task_name
+                    and "mmlu_prox_ru" in req.task_name
                 )
+                if is_russian:
+                    generated = (
+                        f"Давайте подумаем шаг за шагом. "
+                        f"Используя знания по медицине, "
+                        f"правильным ответом будет {gold}."
+                        f"\nОтвет - ({gold})."
+                    )
+                else:
+                    generated = (
+                        f"We refer to Wikipedia articles on {category}"
+                        f" for help. The answer is ({gold})."
+                    )
                 logger.info(
-                    "  stub (mmlu): gold=%r generated=%r", gold, generated,
+                    "  stub (mmlu): gold=%r is_ru=%r generated=%r",
+                    gold, is_russian, generated,
                 )
             results.append(generated)
         return results

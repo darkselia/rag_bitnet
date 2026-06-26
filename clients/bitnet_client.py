@@ -52,7 +52,7 @@ def _build_user_message(messages: list[Message], context: str) -> list[Message]:
     return result
 
 
-def _compute_chat_timings(usage, elapsed_ms: float, model) -> Timings:
+def _compute_chat_timings(usage, elapsed_ms: float) -> Timings:
     if usage is None:
         return Timings(
             prompt_n=0,
@@ -143,7 +143,7 @@ class BitNetAPI(LLM):
         resp.raise_for_status()
         elapsed_ms = (time.monotonic() - start) * 1000
         data = ChatCompletionResponse.model_validate(resp.json())
-        timings = _compute_chat_timings(data.usage, elapsed_ms, data.model) if data.usage else None
+        timings = _compute_chat_timings(data.usage, elapsed_ms) if data.usage else None
         return LLMResp(
             id=data.id,
             content=data.choices[0].message.content,
