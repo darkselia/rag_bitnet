@@ -27,7 +27,7 @@ fi
 
 cd "$BITNET_DIR"
 echo "Starting BitNet server from: $BITNET_DIR"
-python3 "$BITNET_SERVER_SCRIPT" -m "$BITNET_MODEL" -t "$BITNET_THREADS" &
+python3 "$BITNET_SERVER_SCRIPT" -m "$BITNET_MODEL" -t "$BITNET_THREADS" --port "$BITNET_PORT" &
 BITNET_PID=$!
 
 cleanup() {
@@ -40,18 +40,33 @@ trap cleanup EXIT INT TERM
 
 echo "Waiting for BitNet on port $BITNET_PORT..."
 for _ in $(seq 1 120); do
-  if nc -z 127.0.0.1 "$BITNET_PORT" >/dev/null 2>&1; then
+  if ! kill -0 "$BITNET_PID" 2>/dev/null; then
+    echo "ERROR: BitNet server exited during startup."
+    exit 1
+  fi
+  if curl --fail --silent "http://127.0.0.1:$BITNET_PORT/health" >/dev/null 2>&1; then
     echo "BitNet is up."
     break
   fi
   sleep 1
 done
 
-if ! nc -z 127.0.0.1 "$BITNET_PORT" >/dev/null 2>&1; then
+if ! curl --fail --silent "http://127.0.0.1:$BITNET_PORT/health" >/dev/null 2>&1; then
   echo "ERROR: BitNet did not start on port $BITNET_PORT in time."
   exit 1
 fi
 
 cd /app
 echo "Starting API on $API_HOST:$API_PORT"
-python main.py
+python main.py &
+API_PID=$!
+while kill -0 "$BITNET_PID" 2>/dev/null && kill -0 "$API_PID" 2>/dev/null; do
+  sleep 1
+done
+if kill -0 "$API_PID" 2>/dev/null; then
+  kill "$API_PID" || true
+  wait "$API_PID" || true
+  echo "ERROR: BitNet server exited."
+  exit 1
+fi
+wait "$API_PID"
