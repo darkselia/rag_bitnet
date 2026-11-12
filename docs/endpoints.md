@@ -72,8 +72,8 @@ RAG-вопрос. Сервер ищет релевантный контекст 
   из `SYSTEM_PROMPT`.
 - `stream` — если `true`, ответ в формате ndjson-потока.
 - `sources` — список источников: `docs`, `site` или оба.
-- `site_domain` — опциональный фильтр для `site`-источников.
-- `top_k` — количество контекстов для ретрива, от `1` до `50`.
+- `site_domain` — опциональный hostname сайта: точный домен и его поддомены.
+- `top_k` — максимальное количество контекстов, от `1` до `50`; результатов может быть меньше.
 - `temperature` — температура LLM, от `0.0` до `2.0`.
 
 ---
@@ -89,13 +89,13 @@ RAG-вопрос. Сервер ищет релевантный контекст 
   },
   "timings": {
     "prompt_n": 1112,
-    "prompt_ms": 1234.567,
-    "prompt_per_token_ms": 1.11,
-    "prompt_per_second": 900.0,
+    "prompt_ms": null,
+    "prompt_per_token_ms": null,
+    "prompt_per_second": null,
     "predicted_n": 22,
-    "predicted_ms": 3273.456,
-    "predicted_per_token_ms": 148.79,
-    "predicted_per_second": 6.72
+    "predicted_ms": null,
+    "predicted_per_token_ms": null,
+    "predicted_per_second": null
   },
   "used_context": [
     {
@@ -124,10 +124,18 @@ RAG-вопрос. Сервер ищет релевантный контекст 
 {"id": "", "content": " visited", "model": ""}
 {"id": "", "content": " the", "model": ""}
 ...
-{"id": "chatcmpl-xxx", "content": "", "timings": {...}, "model": "BitNet-b1.58-2B-4T", "answer": {"role": "assistant", "content": "Kolobok visited the ..."}, "used_context": [...]}
+{"id": "chatcmpl-xxx", "answer": {"role": "assistant", "content": "Kolobok visited the ..."}, "used_context": [...]}
 ```
 
 Поток состоит из:
 
 1. **Чанки контента** — `{"id": "", "content": "...", "model": ""}` — по одному токену/слову.
-2. **Финальный JSON** — полный `AskResp` с `id`, `answer`, `timings`, `model` и `used_context`.
+2. **Финальный JSON** — `AskResp` с `id`, `answer`, необязательными `timings` и `used_context`.
+
+При ошибке после начала потока последней строкой передаётся `{"error": "LLM stream failed"}` без успешного `AskResp`.
+Ошибка соединения до начала потока возвращается как HTTP 502 или 504. В chat-режиме времена отдельных стадий равны
+`null`, если сервер не сообщил их; число токенов доступно при наличии `usage`.
+
+Если включён `BITNET_CONTEXT_SIZE`, наименее релевантные чанки исключаются до помещения промпта в окно модели;
+`used_context` содержит только отправленные чанки. Если сами сообщения не помещаются, возвращается HTTP 413. Для точной
+проверки server должен поддерживать `/tokenize`, а в chat также `/apply-template`.

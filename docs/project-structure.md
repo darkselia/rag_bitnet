@@ -75,13 +75,12 @@ rag_bitnet/
   рендерит промпт через Jinja2-шаблон `completion_chat_template.jinja`.
 - **Context injection** — общая функция `_build_user_message()` в `bitnet_client.py` модифицирует последнее
   user-сообщение, добавляя контекст.
-- **Timings** — для chat-режима вычисляются пропорционально из `usage.` (prompt_tokens / completion_tokens) + elapsed
-  time; для completion — берутся из ответа сервера (`timings`).
+- **Timings** — в chat-режиме число токенов берётся из `usage`, неизвестные времена равны `null`; в completion они
+  берутся из ответа сервера.
 - **Streaming** — ndjson (`application/x-ndjson`): каждый чанк — отдельная JSON-строка с `{"id","content","model"}`,
-  финальная строка — полный `AskResp` с `id`, `answer`, `timings`, `model`, `used_context`.
-- **CSV logging** — все RAG-запросы логируются в `logs/ask_service.csv` через потокобезопасный `CsvLogger`
-  с обновлением строки по ключу `timestamp`.
-- **Data storage** — индексные файлы (`rows.jsonl`, `embeddings.npy`, `index.faiss`, `bm25_corpus.json`, `meta.json`)
-  хранятся в `data/vector_store/`, настраивается через `DATA_DIR`.
+  финальная строка — `AskResp` с `id`, `answer`, `timings`, `used_context` или строка с ошибкой.
+- **CSV logging** — содержимое запроса и ответа записывается только при `LOG_REQUEST_CONTENT=true`.
+- **Data storage** — версии корпуса, FAISS и метаданных хранятся в `DATA_DIR/versions`; `current.json` указывает на
+  опубликованную версию.
 - **Config** — `SYSTEM_PROMPT` и `BITNET_MODE` валидируются в `common/config.py`; `BITNET_MODE` принимает только
   `chat` или `completion`.

@@ -35,7 +35,7 @@ docker build -f docker/Dockerfile -t rag-bitnet:latest .
 Запуск с внешней папкой BitNet:
 
 ```bash
-docker run --rm -p 8000:8000 -p 8080:8080 \
+docker run --rm -p 127.0.0.1:8000:8000 -p 127.0.0.1:8080:8080 \
   -v "$PWD/data/vector_store:/app/data/vector_store" \
   -v "/absolute/path/to/BitNet:/opt/bitnet" \
   -e BITNET_DIR=/opt/bitnet \
@@ -45,6 +45,10 @@ docker run --rm -p 8000:8000 -p 8080:8080 \
 ```
 
 Контейнер запускает BitNet server и API одним процессом через `docker/start_services.sh`.
+
+Сервис рассчитан на доверенный локальный доступ: авторизации нет, а индексация принимает пути к файлам и URL. Для
+внешнего доступа необходима отдельная защита сети и аутентификация. Порт BitNet в контейнере доступен только внутри
+контейнера, если сервер привязан к `127.0.0.1`.
 
 ## Основные эндпоинты
 
@@ -82,6 +86,13 @@ data/vector_store/  FAISS + BM25 индексы, rows.jsonl, embeddings.npy
 - `SYSTEM_PROMPT` — системный промпт для RAG
 - `BITNET_HOST`, `BITNET_PORT` — адрес BitNet inference server
 - `DATA_DIR` — директория хранения индексов (по умолч. `./data/vector_store`)
+- `BITNET_TIMEOUT` — таймаут HTTP в секундах, по умолчанию 60.
+- `BITNET_CONTEXT_SIZE` — размер контекста одного слота, при `0` проверка размера отключена. При положительном значении
+  используется `/tokenize`; для chat также необходим `/apply-template`. Сервер без этих endpoints возвращает ошибку
+  вместо приблизительного подсчёта.
+- `LOG_REQUEST_CONTENT` — сохранять ли вопросы, контекст и ответы в CSV; по умолчанию `false`.
+- `RETRIEVAL_SIM_THRESHOLD` — порог косинусной близости для векторных кандидатов; `0` отключает порог. Его следует
+  подбирать на собственном наборе запросов.
 
 ## Зависимости
 

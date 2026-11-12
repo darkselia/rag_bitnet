@@ -53,7 +53,7 @@ BitNetAPI(LLM)
 - Endpoint: `/v1/chat/completions` (OpenAI-compatible)
 - Payload: `{ messages: [...], stream: true/false, max_tokens, temperature }`
 - Контекст вплетается в последнее user-сообщение.
-- Timings вычисляются клиентом из `usage` (prompt_tokens / completion_tokens) и elapsed time.
+- Из `usage` берётся количество токенов; неизвестные времена отдельных стадий равны `null`.
 - Парсинг SSE через `ChatCompletionChunk` → `choices[0].delta.content`.
 
 ### Completion Mode (`BITNET_MODE=completion`)
@@ -73,9 +73,10 @@ class LLMResp(BaseModel):
     content: str
     timings: Optional[Timings] = None
     model: str = ""
+    final: bool = False
 ```
 
-- `content` — текст (в стриме — один токен/слово, в последнем чанке — полный ответ).
+- `content` — текст; в стриме финальное событие с `final=True` содержит метаданные, а не повтор полного ответа.
 - `id` — идентификатор ответа (chat-completion id или id_slot).
 - `timings` — метрики производительности (только в последнем чанке стрима или в JSON-ответе).
 - `model` — имя модели из ответа сервера.
