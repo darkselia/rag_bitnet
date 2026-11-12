@@ -30,7 +30,6 @@ logger = get_logger("bitnet_client")
 def _render_prompt(messages: list[Message]) -> str:
     dicts = [m.model_dump() for m in messages]
     result = _completion_template.render(messages=dicts, add_generation_prompt=True)
-    logger.info(f"build_user_message: {result}")
     return result
 
 
@@ -47,43 +46,14 @@ def _build_user_message(messages: list[Message], context: str) -> list[Message]:
                     f"Question: {question}\n"
                 ),
             )
-            logger.info(f"build_user_message: {result[i]}")
             break
     return result
 
 
 def _compute_chat_timings(usage, elapsed_ms: float) -> Timings:
-    if usage is None:
-        return Timings(
-            prompt_n=0,
-            prompt_ms=0,
-            prompt_per_token_ms=0,
-            prompt_per_second=0,
-            predicted_n=0,
-            predicted_ms=0,
-            predicted_per_token_ms=0,
-            predicted_per_second=0,
-        )
-    prompt_n = usage.prompt_tokens
-    predicted_n = usage.completion_tokens
-    total_n = prompt_n + predicted_n
-    if total_n > 0:
-        prompt_ms = elapsed_ms * (prompt_n / total_n)
-        predicted_ms = elapsed_ms * (predicted_n / total_n)
-    else:
-        prompt_ms = elapsed_ms / 2
-        predicted_ms = elapsed_ms / 2
-    prompt_per_token_ms = prompt_ms / prompt_n if prompt_n > 0 else 0.0
-    predicted_per_token_ms = predicted_ms / predicted_n if predicted_n > 0 else 0.0
     return Timings(
-        prompt_n=prompt_n,
-        prompt_ms=prompt_ms,
-        prompt_per_token_ms=prompt_per_token_ms,
-        prompt_per_second=1000.0 / prompt_per_token_ms if prompt_per_token_ms > 0 else 0.0,
-        predicted_n=predicted_n,
-        predicted_ms=predicted_ms,
-        predicted_per_token_ms=predicted_per_token_ms,
-        predicted_per_second=1000.0 / predicted_per_token_ms if predicted_per_token_ms > 0 else 0.0,
+        prompt_n=usage.prompt_tokens,
+        predicted_n=usage.completion_tokens,
     )
 
 
@@ -100,6 +70,26 @@ class BitNetAPI(LLM):
         if self.mode == "chat":
             return f"{self.base}/v1/chat/completions"
         return f"{self.base}/completion"
+
+    def count_prompt_tokens(self, messages: list[Message], context: str) -> int:
+        prepared = _build_user_message(messages, context)
+        if self.mode == "chat":
+            response = requests.post(
+                f"{self.base}/apply-template",
+                json={"messages": [m.model_dump() for m in prepared]}, timeout=self.timeout,
+            )
+            response.raise_for_status()
+            prompt = response.json()["prompt"]
+        else:
+            prompt = _render_prompt(prepared)
+        response = requests.post(
+            f"{self.base}/tokenize", json={"content": prompt, "add_special": True}, timeout=self.timeout,
+        )
+        response.raise_for_status()
+        tokens = response.json()["tokens"]
+        if not isinstance(tokens, list):
+            raise ValueError("Invalid tokenizer response")
+        return len(tokens)
 
     def generate(
             self,
@@ -170,6 +160,8 @@ class BitNetAPI(LLM):
         resp = requests.post(self._url, json=payload, timeout=self.timeout)
         resp.raise_for_status()
         data = CompletionResponse.model_validate(resp.json())
+        if data.truncated:
+            raise ValueError("BitNet truncated the input prompt")
         timings = Timings.model_validate(data.timings) if data.timings else None
         return LLMResp(
             id=str(data.index),
@@ -197,23 +189,25 @@ class BitNetAPI(LLM):
         response_id = ""
         usage = None
         model = ""
+        finished = False
         with requests.post(self._url, json=payload, timeout=self.timeout, stream=True) as resp:
             resp.raise_for_status()
             resp.encoding = "utf-8"
             for raw_line in resp.iter_lines(decode_unicode=False):
                 if isinstance(raw_line, bytes):
-                    line = raw_line.decode("utf-8", errors="replace")
+                    line = raw_line.decode("utf-8")
                 else:
                     line = raw_line
-                if not line:
+                if not line or line.startswith((":", "event:", "id:", "retry:")):
                     continue
                 data_part = line[len("data:"):].strip() if line.startswith("data:") else line.strip()
-                if not data_part or data_part == "[DONE]":
+                if data_part == "[DONE]":
+                    break
+                if not data_part:
                     continue
-                try:
-                    chunk = ChatCompletionChunk.model_validate_json(data_part)
-                except Exception:
-                    continue
+                chunk = ChatCompletionChunk.model_validate_json(data_part)
+                if chunk.usage:
+                    usage = chunk.usage
                 if not chunk.choices:
                     continue
                 piece = chunk.choices[0].delta.content or ""
@@ -222,15 +216,15 @@ class BitNetAPI(LLM):
                     yield LLMResp(id=chunk.id, content=piece, model=chunk.model or "")
                 if chunk.model:
                     model = chunk.model
-                if chunk.usage:
-                    usage = chunk.usage
                 if chunk.id:
                     response_id = chunk.id
                 if chunk.choices[0].finish_reason:
-                    break
+                    finished = True
+        if not finished:
+            raise ValueError("BitNet stream ended without a finish event")
         elapsed_ms = (time.monotonic() - start) * 1000
         timings = _compute_chat_timings(usage, elapsed_ms) if usage else None
-        yield LLMResp(id=response_id, content="".join(content_pieces), timings=timings, model=model)
+        yield LLMResp(id=response_id, content="", timings=timings, model=model, final=True)
 
     def _generate_completion_stream(
             self,
@@ -256,34 +250,27 @@ class BitNetAPI(LLM):
             resp.encoding = "utf-8"
             for raw_line in resp.iter_lines(decode_unicode=False):
                 if isinstance(raw_line, bytes):
-                    line = raw_line.decode("utf-8", errors="replace")
+                    line = raw_line.decode("utf-8")
                 else:
                     line = raw_line
-                if not line:
+                if not line or line.startswith((":", "event:", "id:", "retry:")):
                     continue
                 data_part = line[len("data:"):].strip() if line.startswith("data:") else line.strip()
                 if not data_part:
                     continue
-                try:
-                    chunk = CompletionStreamChunk.model_validate_json(data_part)
-                except Exception:
-                    continue
+                chunk = CompletionStreamChunk.model_validate_json(data_part)
                 if chunk.content:
                     content_pieces.append(chunk.content)
                     yield LLMResp(id=str(chunk.index), content=chunk.content)
                 if chunk.stop:
                     final_data = data_part
                     break
-        if final_data and content_pieces:
-            try:
-                full = CompletionResponse.model_validate_json(final_data)
-                timings = full.timings if full.timings else None
-                model = full.model
-                yield LLMResp(id=str(full.index), content="".join(content_pieces), timings=timings, model=model)
-            except Exception:
-                yield LLMResp(content="".join(content_pieces))
-        elif content_pieces:
-            yield LLMResp(content="".join(content_pieces))
+        if not final_data:
+            raise ValueError("BitNet stream ended without a finish event")
+        full = CompletionResponse.model_validate_json(final_data)
+        if full.truncated:
+            raise ValueError("BitNet truncated the input prompt")
+        yield LLMResp(id=str(full.index), content="", timings=full.timings, model=full.model, final=True)
 
 
 bitnet_client = BitNetAPI()

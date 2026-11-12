@@ -12,13 +12,13 @@ class Message(BaseModel):
 
 class Timings(BaseModel):
     prompt_n: int
-    prompt_ms: float
-    prompt_per_token_ms: float
-    prompt_per_second: float
+    prompt_ms: float | None = None
+    prompt_per_token_ms: float | None = None
+    prompt_per_second: float | None = None
     predicted_n: int
-    predicted_ms: float
-    predicted_per_token_ms: float
-    predicted_per_second: float
+    predicted_ms: float | None = None
+    predicted_per_token_ms: float | None = None
+    predicted_per_second: float | None = None
 
 
 class IngestFilesReq(BaseModel):
@@ -59,3 +59,4 @@ class LLMResp(BaseModel):
     content: str
     timings: Optional[Timings] = None
     model: str = ""
+    final: bool = False

@@ -101,9 +101,12 @@ BITNET_MODE: Literal["chat", "completion"] = _raw_bitnet_mode
 
 BITNET_HOST = _env_str("BITNET_HOST", "127.0.0.1")
 BITNET_PORT = _env_int("BITNET_PORT", 8080, min_value=1)
-BITNET_TIMEOUT = _env_int("BITNET_TIMEOUT", 60000, min_value=1)
+BITNET_TIMEOUT = _env_int("BITNET_TIMEOUT", 60, min_value=1)
+BITNET_CONTEXT_SIZE = _env_int("BITNET_CONTEXT_SIZE", 0, min_value=0)
+LOG_REQUEST_CONTENT = _env_bool("LOG_REQUEST_CONTENT", False)
+RETRIEVAL_SIM_THRESHOLD = _env_float("RETRIEVAL_SIM_THRESHOLD", 0.0, min_value=-1.0, max_value=1.0)
 
-API_HOST = _env_str("API_HOST", "0.0.0.0")
+API_HOST = _env_str("API_HOST", "127.0.0.1")
 API_PORT = _env_int("API_PORT", 8000, min_value=1)
 
 CORPUS_JSONL = DATA_DIR / "rows.jsonl"

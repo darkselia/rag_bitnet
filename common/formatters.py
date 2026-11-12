@@ -8,8 +8,8 @@ from urllib.parse import urljoin, urldefrag
 import requests
 import tldextract
 from bs4 import BeautifulSoup
-from common.logger import get_logger
 
+from common.logger import get_logger
 
 logger = get_logger("ingest")
 
@@ -213,7 +213,8 @@ def _record_id_from_json(value: Any, fallback: str) -> str:
         for key in ("id", "_id", "uuid", "slug", "key"):
             record_id = _stringify_json_value(value.get(key))
             if record_id:
-                return f"{fallback}:{record_id}"
+                parent = re.sub(r"\[\d+\]$", "", fallback)
+                return f"{parent}:{key}:{record_id}"
     return fallback
 
 

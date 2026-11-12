@@ -1,5 +1,11 @@
+import hashlib
 import json
-from typing import Dict, List, Optional
+import os
+import threading
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import faiss
 import numpy as np
@@ -8,177 +14,135 @@ from rank_bm25 import BM25Okapi
 from common import config
 from common.text_utils import tokenize
 from rag.models import get_embed_model
-from common.logger import get_logger
-
-rows: List[Dict] = []
-corpus: List[str] = []
-index: Optional[faiss.IndexFlatIP] = None
-embeddings: Optional[np.ndarray] = None
-bm25: Optional[BM25Okapi] = None
-
-logger = get_logger("index")
 
 
-def _load_jsonl(path) -> List[Dict]:
-    if not path.exists():
-        return []
-    return [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines() if l.strip()]
+@dataclass(frozen=True)
+class Snapshot:
+    rows: list[dict[str, Any]]
+    corpus: list[str]
+    index: Any
+    bm25: Any
 
 
-def _save_jsonl(path, data: List[Dict]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        for r in data:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+_lock = threading.RLock()
+_snapshot = Snapshot([], [], None, None)
+rows: list[dict[str, Any]] = []
+
+
+def snapshot() -> Snapshot:
+    return _snapshot
 
 
 def _norm_path(path: str) -> str:
-    return path.replace("\\", "/")
+    return os.path.normcase(str(Path(path).resolve())).replace("\\", "/")
 
 
-def _ensure_data_dir() -> None:
-    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+def _bm25(corpus: list[str]) -> Any:
+    tokens = [tokenize(text) for text in corpus]
+    return BM25Okapi(tokens) if any(tokens) else None
 
 
-def save_index() -> None:
-    _ensure_data_dir()
-    _save_jsonl(config.CORPUS_JSONL, rows)
-    if embeddings is not None:
-        np.save(config.EMB_NPY, embeddings)
-    elif config.EMB_NPY.exists():
-        config.EMB_NPY.unlink()
-    if index is not None:
-        try:
-            faiss.write_index(index, str(config.FAISS_INDEX))
-        except Exception as e:  # keep server alive on faiss write issues
-            logger.warning("faiss write warning: %s", e)
-    elif config.FAISS_INDEX.exists():
-        config.FAISS_INDEX.unlink()
-    with open(config.BM25_JSON, "w", encoding="utf-8") as f:
-        json.dump(corpus, f, ensure_ascii=False)
-    with open(config.META_JSON, "w", encoding="utf-8") as f:
-        json.dump(config.meta_payload(len(rows)), f)
+def _digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def load_index():
-    global rows, corpus, embeddings, index, bm25
-    rows = _load_jsonl(config.CORPUS_JSONL)
-    corpus = [r.get("text", "") for r in rows]
+def load_index() -> None:
+    global _snapshot, rows
+    pointer = config.DATA_DIR / "current.json"
+    if not pointer.exists():
+        if config.CORPUS_JSONL.exists() or config.FAISS_INDEX.exists():
+            raise RuntimeError("Legacy index detected. Preserve it and reindex into a new DATA_DIR.")
+        return
+    version = json.loads(pointer.read_text(encoding="utf-8"))["version"]
+    if Path(version).name != version:
+        raise ValueError("Invalid index version")
+    directory = config.DATA_DIR / "versions" / version
+    meta = json.loads((directory / "meta.json").read_text(encoding="utf-8"))
+    if meta.get("format") != 2 or meta.get("version") != version or meta.get("embed_model") != config.EMBED_MODEL:
+        raise ValueError("Index version or embedding model mismatch; reindex into a new DATA_DIR")
+    for name, expected in meta["sha256"].items():
+        if name not in {"rows.jsonl", "index.faiss"} or _digest(directory / name) != expected:
+            raise ValueError("Index version checksum mismatch")
+    if "rows.jsonl" not in meta["sha256"] or (meta["count"] and "index.faiss" not in meta["sha256"]):
+        raise ValueError("Index version is incomplete")
+    loaded_rows = [json.loads(line) for line in (directory / "rows.jsonl").read_text(encoding="utf-8").splitlines() if
+                   line]
+    corpus = [r["text"] for r in loaded_rows]
+    idx = faiss.read_index(str(directory / "index.faiss")) if corpus else None
+    if len(corpus) != meta["count"] or (idx is not None and idx.ntotal != len(corpus)):
+        raise ValueError("Index and corpus sizes do not match")
+    rows = loaded_rows
+    _snapshot = Snapshot(rows, corpus, idx, _bm25(corpus))
 
-    embeddings = np.load(config.EMB_NPY) if config.EMB_NPY.exists() else None
 
-    if config.FAISS_INDEX.exists():
-        try:
-            index_obj = faiss.read_index(str(config.FAISS_INDEX))
-        except Exception as e:
-            logger.warning("faiss load warning: %s", e)
-            index_obj = None
-    else:
-        index_obj = None
-    if index_obj is not None and index_obj.ntotal != len(corpus):
-        logger.warning("faiss load warning: index size %s != corpus size %s", index_obj.ntotal, len(corpus))
-        index_obj = None
-    if embeddings is not None and embeddings.shape[0] != len(corpus):
-        logger.warning("embeddings load warning: embeddings size %s != corpus size %s", embeddings.shape[0], len(corpus))
-        embeddings = None
-    index = index_obj
+def _commit(new_rows: list[dict[str, Any]]) -> None:
+    global _snapshot, rows
+    ids = [row["id"] for row in new_rows]
+    if len(ids) != len(set(ids)):
+        raise ValueError("Duplicate chunk IDs")
+    corpus = [r["text"] for r in new_rows]
+    idx = None
+    if corpus:
+        model = get_embed_model()
+        vectors = []
+        for i in range(0, len(corpus), config.EMBED_BATCH):
+            batch = corpus[i:i + config.EMBED_BATCH]
+            vectors.append(
+                model.encode(batch, batch_size=len(batch), show_progress_bar=False, normalize_embeddings=True))
+        embeddings = np.vstack(vectors).astype("float32")
+        idx = faiss.IndexFlatIP(embeddings.shape[1])
+        idx.add(embeddings)
+    bm25 = _bm25(corpus)
+    version = uuid.uuid4().hex
+    directory = config.DATA_DIR / "versions" / version
+    directory.mkdir(parents=True)
+    with (directory / "rows.jsonl").open("w", encoding="utf-8") as f:
+        for row in new_rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    if idx is not None:
+        faiss.write_index(idx, str(directory / "index.faiss"))
+        if faiss.read_index(str(directory / "index.faiss")).ntotal != len(corpus):
+            raise ValueError("Saved index size mismatch")
+    files = ["rows.jsonl"] + (["index.faiss"] if idx is not None else [])
+    meta = {**config.meta_payload(len(corpus)), "version": version, "format": 2,
+            "sha256": {name: _digest(directory / name) for name in files}}
+    (directory / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    pointer_tmp = config.DATA_DIR / f"current.{version}.tmp"
+    pointer_tmp.write_text(json.dumps({"version": version}), encoding="utf-8")
+    os.replace(pointer_tmp, config.DATA_DIR / "current.json")
+    rows = new_rows
+    _snapshot = Snapshot(rows, corpus, idx, bm25)
 
-    bm25_corpus = corpus
-    if config.BM25_JSON.exists():
-        try:
-            with open(config.BM25_JSON, "r", encoding="utf-8") as f:
-                loaded_bm25_corpus = json.load(f)
-            if loaded_bm25_corpus and len(loaded_bm25_corpus) == len(corpus):
-                bm25_corpus = loaded_bm25_corpus
-        except Exception as e:
-            logger.warning("bm25 load warning: %s", e)
-    bm25_tokens = []
-    for c in bm25_corpus:
-        tokens = tokenize(c)
-        if tokens:
-            bm25_tokens.append(tokens)
-    bm25_obj = BM25Okapi(bm25_tokens) if bm25_tokens else None
-    bm25 = bm25_obj
+
+def replace_chunks_by_paths(paths: set[str], chunks: list[dict[str, Any]]) -> int:
+    with _lock:
+        normalized = {_norm_path(path) for path in paths}
+        kept = [r for r in rows if _norm_path(str(r.get("meta", {}).get("path", ""))) not in normalized]
+        _commit(kept + chunks)
+        return len(chunks)
+
+
+def replace_chunks_by_documents(document_ids: set[str], chunks: list[dict[str, Any]]) -> int:
+    with _lock:
+        kept = [r for r in rows if r.get("meta", {}).get("document_id") not in document_ids]
+        _commit(kept + chunks)
+        return len(chunks)
+
+
+def add_chunks(chunks: list[dict[str, Any]]) -> int:
+    with _lock:
+        ids = [c["id"] for c in chunks]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Duplicate chunk IDs in ingestion")
+        existing = {r["id"] for r in rows}
+        new_items = [c for c in chunks if c["id"] not in existing]
+        if new_items:
+            _commit(rows + new_items)
+        return len(new_items)
 
 
 load_index()
-
-
-def rebuild_indices(batch_size: int = config.EMBED_BATCH) -> None:
-    global corpus, embeddings, index, bm25
-    rows[:] = [r for r in rows if r.get("text")]
-    corpus = [r["text"] for r in rows]
-    logger.info("[index] rebuilding indices for %s chunks", len(corpus))
-    if not corpus:
-        embeddings = None
-        index = None
-        bm25 = None
-        save_index()
-        logger.info("[index] saved empty indices")
-        return
-
-    em = get_embed_model()
-    encs = []
-    for i in range(0, len(corpus), batch_size):
-        batch = corpus[i:i + batch_size]
-        logger.info("[index] embedding batch %s/%s", i // batch_size + 1, (len(corpus) + batch_size - 1) // batch_size)
-        enc = em.encode(batch, batch_size=len(batch), show_progress_bar=False, normalize_embeddings=True)
-        encs.append(enc)
-    embeddings = np.vstack(encs).astype("float32")
-
-    dim = embeddings.shape[1]
-    cpu_index = faiss.IndexFlatIP(dim)
-    cpu_index.add(embeddings)
-    index = cpu_index
-
-    bm25_tokens = []
-    for c in corpus:
-        tokens = tokenize(c)
-        if tokens:
-            bm25_tokens.append(tokens)
-    bm25 = BM25Okapi(bm25_tokens) if bm25_tokens else None
-    if bm25 is None:
-        logger.info("[index] bm25 disabled: no indexable tokens in corpus")
-    save_index()
-    logger.info("[index] rebuild complete")
-
-
-def remove_chunks_by_paths(paths: set[str]) -> int:
-    global rows
-    if not paths:
-        return 0
-
-    normalized_paths = {_norm_path(path) for path in paths}
-    before = len(rows)
-    rows = [
-        r for r in rows
-        if _norm_path(str(r.get("meta", {}).get("path", ""))) not in normalized_paths
-    ]
-    removed = before - len(rows)
-    if removed:
-        rebuild_indices()
-    return removed
-
-
-def replace_chunks_by_paths(paths: set[str], chunks: List[Dict]) -> int:
-    global rows
-    normalized_paths = {_norm_path(path) for path in paths}
-    kept_rows = [
-        r for r in rows
-        if _norm_path(str(r.get("meta", {}).get("path", ""))) not in normalized_paths
-    ]
-    existing_ids = {r["id"] for r in kept_rows}
-    new_items = [c for c in chunks if c["id"] not in existing_ids]
-
-    rows = kept_rows + new_items
-    rebuild_indices()
-    return len(new_items)
-
-
-def add_chunks(chunks: List[Dict]) -> int:
-    existing_ids = {r["id"] for r in rows}
-    new_items = [c for c in chunks if c["id"] not in existing_ids]
-    if not new_items:
-        return 0
-    rows.extend(new_items)
-    rebuild_indices()
-    return len(new_items)

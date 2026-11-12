@@ -2,8 +2,10 @@ import json
 import time
 from collections.abc import Iterator
 from datetime import datetime, timezone
+from itertools import chain
 from typing import Dict, List
 
+import requests
 from fastapi import HTTPException
 from starlette.concurrency import run_in_threadpool
 from starlette.responses import StreamingResponse
@@ -25,6 +27,16 @@ CSV_FIELDS = [
 csv_logger = CsvLogger("ask_service", fieldnames=CSV_FIELDS, key="timestamp")
 
 
+def _log_csv(row: dict) -> None:
+    if not config.LOG_REQUEST_CONTENT:
+        row = {k: v for k, v in row.items() if k not in {"user question", "contest", "llm answer"}}
+    csv_logger.log(row)
+
+
+def _fmt(value: float | None) -> str:
+    return f"{value:.3f}" if value is not None else ""
+
+
 def _build_context_text(contexts: List[Dict]) -> str:
     return "\n\n---\n\n".join(f"[{c['id']}]\n{c['text']}" for c in contexts)
 
@@ -37,33 +49,36 @@ def _extract_query(messages: List[Message]) -> str:
 
 
 def _stream_answer(
-        llm, messages: List[Message], ctx_text: str, contexts: List[Dict],
-        temperature: float, max_tokens: int,
+        pieces: Iterator, ctx_text: str, contexts: List[Dict],
         query: str, retrieve_elapsed: float,
-        timestamp: str,
+        timestamp: str, llm_start: float | None = None,
 ) -> Iterator[str]:
     chunks: list[str] = []
     final_id = ""
     final_timings = None
     final_model = ""
-    llm_start = time.time()
+    if llm_start is None:
+        llm_start = time.monotonic()
+    finished = False
     try:
-        for piece in llm.generate_stream(
-                messages, max_tokens, temperature, context=ctx_text,
-        ):
-            if piece.timings is not None:
+        for piece in pieces:
+            if piece.final:
                 final_id = piece.id
                 final_timings = piece.timings
                 final_model = piece.model
+                finished = True
                 continue
             chunks.append(piece.content)
-            yield json.dumps(piece.model_dump(), ensure_ascii=False) + "\n"
+            yield json.dumps(piece.model_dump(exclude={"final"}), ensure_ascii=False) + "\n"
+        if not finished:
+            raise ValueError("LLM stream ended without a final event")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM error: {e}") from e
+        logger.warning("LLM stream failed: %s", e)
+        yield json.dumps({"error": "LLM stream failed"}) + "\n"
+        return
 
-    llm_elapsed = time.time() - llm_start
+    llm_elapsed = time.monotonic() - llm_start
     answer = "".join(chunks)
-    preview = answer[:80] + ("..." if len(answer) > 80 else "")
     logger.info(
         "llm: mode=%s model=%s prompt_n=%s predicted_n=%s elapsed=%.3fs",
         config.BITNET_MODE, final_model,
@@ -71,15 +86,15 @@ def _stream_answer(
         final_timings.predicted_n if final_timings else "?",
         llm_elapsed,
     )
-    logger.info("answer: id=%s preview=%s", final_id, preview)
+    logger.info("answer: id=%s", final_id)
     yield json.dumps(AskResp(
         id=final_id,
         answer=Message(role="assistant", content=answer),
         timings=final_timings,
         used_context=contexts,
-    ).model_dump(exclude_none=True), ensure_ascii=False) + "\n"
+    ).model_dump(), ensure_ascii=False) + "\n"
 
-    csv_logger.log({
+    _log_csv({
         "timestamp": timestamp,
         "retrieve time": f"{retrieve_elapsed:.3f}",
         "user question": query,
@@ -88,13 +103,13 @@ def _stream_answer(
         "llm answer": answer,
         "id": final_id,
         "prompt_n": final_timings.prompt_n if final_timings else "",
-        "prompt_ms": f"{final_timings.prompt_ms:.3f}" if final_timings else "",
-        "prompt_per_token_ms": f"{final_timings.prompt_per_token_ms:.3f}" if final_timings else "",
-        "prompt_per_second": f"{final_timings.prompt_per_second:.3f}" if final_timings else "",
+        "prompt_ms": _fmt(final_timings.prompt_ms) if final_timings else "",
+        "prompt_per_token_ms": _fmt(final_timings.prompt_per_token_ms) if final_timings else "",
+        "prompt_per_second": _fmt(final_timings.prompt_per_second) if final_timings else "",
         "predicted_n": final_timings.predicted_n if final_timings else "",
-        "predicted_ms": f"{final_timings.predicted_ms:.3f}" if final_timings else "",
-        "predicted_per_token_ms": f"{final_timings.predicted_per_token_ms:.3f}" if final_timings else "",
-        "predicted_per_second": f"{final_timings.predicted_per_second:.3f}" if final_timings else "",
+        "predicted_ms": _fmt(final_timings.predicted_ms) if final_timings else "",
+        "predicted_per_token_ms": _fmt(final_timings.predicted_per_token_ms) if final_timings else "",
+        "predicted_per_second": _fmt(final_timings.predicted_per_second) if final_timings else "",
         "model": final_model,
     })
 
@@ -105,13 +120,13 @@ async def ask(req: AskReq) -> AskResp | StreamingResponse:
     query = _extract_query(req.messages)
     timestamp = datetime.now(timezone.utc).isoformat()
     logger.info(
-        "request query=%r sources=%s top_k=%s temperature=%s stream=%s",
-        query, req.sources, req.top_k, req.temperature, req.stream,
+        "request sources=%s top_k=%s temperature=%s stream=%s",
+        req.sources, req.top_k, req.temperature, req.stream,
     )
 
     retrieve_start = time.time()
     contexts = await retrieve_async(
-        query, 8, 8, req.top_k, 0.0, req.sources, req.site_domain,
+        query, req.top_k, req.top_k, req.top_k, config.RETRIEVAL_SIM_THRESHOLD, req.sources, req.site_domain,
     )
     retrieve_elapsed = time.time() - retrieve_start
     logger.info("retrieve: contexts=%d elapsed=%.3fs", len(contexts), retrieve_elapsed)
@@ -119,36 +134,63 @@ async def ask(req: AskReq) -> AskResp | StreamingResponse:
     if not contexts:
         raise HTTPException(status_code=404, detail="No relevant context found")
 
+    messages = [Message(role="system", content=config.SYSTEM_PROMPT)] + req.messages
+    llm = get_llm()
+    if llm is None:
+        raise HTTPException(status_code=500, detail="No LLM configured")
+
+    if config.BITNET_CONTEXT_SIZE:
+        while True:
+            ctx_text = _build_context_text(contexts)
+            try:
+                count = await run_in_threadpool(llm.count_prompt_tokens, messages, ctx_text)
+            except requests.Timeout as e:
+                raise HTTPException(status_code=504, detail="LLM tokenizer timed out") from e
+            except (requests.RequestException, ValueError, KeyError) as e:
+                raise HTTPException(status_code=502, detail="Exact prompt tokenization unavailable") from e
+            if count + config.LLM_MAX_TOKENS <= config.BITNET_CONTEXT_SIZE:
+                break
+            if not contexts:
+                raise HTTPException(status_code=413, detail="Messages exceed the model context window")
+            contexts.pop()
     ctx_text = _build_context_text(contexts)
-    csv_logger.log({
+    _log_csv({
         "timestamp": timestamp,
         "retrieve time": f"{retrieve_elapsed:.3f}",
         "user question": query,
         "contest": ctx_text,
     })
 
-    messages = [Message(role="system", content=config.SYSTEM_PROMPT)] + req.messages
-    llm = get_llm()
-    if llm is None:
-        raise HTTPException(status_code=500, detail="No LLM configured")
-
     if req.stream:
         logger.info("stream: started")
+        llm_start = time.monotonic()
+        pieces = llm.generate_stream(messages, config.LLM_MAX_TOKENS, req.temperature, context=ctx_text)
+        try:
+            first = await run_in_threadpool(next, pieces, None)
+        except requests.Timeout as e:
+            raise HTTPException(status_code=504, detail="LLM request timed out") from e
+        except (requests.RequestException, ValueError) as e:
+            raise HTTPException(status_code=502, detail="LLM request failed") from e
+        if first is None:
+            raise HTTPException(status_code=502, detail="LLM stream ended unexpectedly")
         return StreamingResponse(
             _stream_answer(
-                llm, messages, ctx_text, contexts,
-                req.temperature, config.LLM_MAX_TOKENS,
-                query, retrieve_elapsed, timestamp,
+                chain([first], pieces), ctx_text, contexts,
+                query, retrieve_elapsed, timestamp, llm_start,
             ),
             media_type="application/x-ndjson; charset=utf-8",
         )
 
     llm_start = time.time()
-    resp = await run_in_threadpool(
-        llm.generate, messages, config.LLM_MAX_TOKENS, req.temperature, context=ctx_text,
-    )
+    try:
+        resp = await run_in_threadpool(
+            llm.generate, messages, config.LLM_MAX_TOKENS, req.temperature, context=ctx_text,
+        )
+    except requests.Timeout as e:
+        raise HTTPException(status_code=504, detail="LLM request timed out") from e
+    except (requests.RequestException, ValueError) as e:
+        raise HTTPException(status_code=502, detail="LLM request failed") from e
     llm_elapsed = time.time() - llm_start
-    preview = resp.content[:80] + ("..." if len(resp.content) > 80 else "")
     logger.info(
         "llm: mode=%s model=%s prompt_n=%s predicted_n=%s elapsed=%.3fs",
         config.BITNET_MODE, resp.model,
@@ -156,9 +198,9 @@ async def ask(req: AskReq) -> AskResp | StreamingResponse:
         resp.timings.predicted_n if resp.timings else "?",
         llm_elapsed,
     )
-    logger.info("answer: id=%s preview=%s", resp.id, preview)
+    logger.info("answer: id=%s", resp.id)
 
-    csv_logger.log({
+    _log_csv({
         "timestamp": timestamp,
         "retrieve time": f"{retrieve_elapsed:.3f}",
         "user question": query,
@@ -167,13 +209,13 @@ async def ask(req: AskReq) -> AskResp | StreamingResponse:
         "llm answer": resp.content,
         "id": resp.id,
         "prompt_n": resp.timings.prompt_n if resp.timings else "",
-        "prompt_ms": f"{resp.timings.prompt_ms:.3f}" if resp.timings else "",
-        "prompt_per_token_ms": f"{resp.timings.prompt_per_token_ms:.3f}" if resp.timings else "",
-        "prompt_per_second": f"{resp.timings.prompt_per_second:.3f}" if resp.timings else "",
+        "prompt_ms": _fmt(resp.timings.prompt_ms) if resp.timings else "",
+        "prompt_per_token_ms": _fmt(resp.timings.prompt_per_token_ms) if resp.timings else "",
+        "prompt_per_second": _fmt(resp.timings.prompt_per_second) if resp.timings else "",
         "predicted_n": resp.timings.predicted_n if resp.timings else "",
-        "predicted_ms": f"{resp.timings.predicted_ms:.3f}" if resp.timings else "",
-        "predicted_per_token_ms": f"{resp.timings.predicted_per_token_ms:.3f}" if resp.timings else "",
-        "predicted_per_second": f"{resp.timings.predicted_per_second:.3f}" if resp.timings else "",
+        "predicted_ms": _fmt(resp.timings.predicted_ms) if resp.timings else "",
+        "predicted_per_token_ms": _fmt(resp.timings.predicted_per_token_ms) if resp.timings else "",
+        "predicted_per_second": _fmt(resp.timings.predicted_per_second) if resp.timings else "",
         "model": resp.model,
     })
 

@@ -1,4 +1,5 @@
 from typing import Dict, List, Optional
+from urllib.parse import urlsplit
 
 import numpy as np
 from starlette.concurrency import run_in_threadpool
@@ -26,14 +27,18 @@ async def retrieve_async(query: str, k_vec: int = 8, k_bm25: int = 8, k_final: i
     )
 
 
-def _allowed_indices(sources: Optional[List[str]], site_domain: Optional[str]) -> Optional[set[int]]:
+def _allowed_indices(rows: List[Dict], sources: Optional[List[str]], site_domain: Optional[str]) -> Optional[set[int]]:
     allowed_ids = None
     if sources:
-        allowed_ids = {i for i, r in enumerate(data_store.rows) if r.get("kind") in set(sources)}
+        allowed_ids = {i for i, r in enumerate(rows) if r.get("kind") in set(sources)}
     if site_domain:
+        domain = site_domain.lower().rstrip(".")
         site_ids = {
-            i for i, r in enumerate(data_store.rows)
-            if r.get("kind") == "site" and site_domain in r.get("source", "")
+            i for i, r in enumerate(rows)
+            if r.get("kind") == "site" and (
+                    (host := (urlsplit(r.get("source", "")).hostname or "").lower().rstrip(".")) == domain
+                    or host.endswith("." + domain)
+            )
         }
         allowed_ids = site_ids if allowed_ids is None else allowed_ids & site_ids
     return allowed_ids
@@ -63,10 +68,11 @@ def retrieve(query: str, k_vec: int = 8, k_bm25: int = 8, k_final: int = 6, sim_
              sources: Optional[List[str]] = None, site_domain: Optional[str] = None) -> List[Dict]:
     if k_final <= 0:
         return []
-    if data_store.index is None or len(data_store.corpus) == 0:
+    state = data_store.snapshot()
+    if state.index is None or len(state.corpus) == 0:
         return []
 
-    allowed_ids = _allowed_indices(sources, site_domain)
+    allowed_ids = _allowed_indices(state.rows, sources, site_domain)
     if allowed_ids is not None and not allowed_ids:
         return []
 
@@ -74,27 +80,27 @@ def retrieve(query: str, k_vec: int = 8, k_bm25: int = 8, k_final: int = 6, sim_
 
     em = get_embed_model()
     q_emb = em.encode([query], normalize_embeddings=True).astype("float32")
-    vec_search_k = k_vec
+    vec_search_k = max(k_vec, k_final)
     if allowed_ids is not None:
-        vec_search_k = max(k_vec * 10, k_final * 20, config.CROSS_RERANKER_TOPK * 3, 100)
-    vec_search_k = min(len(data_store.corpus), vec_search_k)
+        vec_search_k = len(state.corpus)
+    vec_search_k = min(len(state.corpus), vec_search_k)
 
-    D, I = data_store.index.search(q_emb, vec_search_k)
+    D, I = state.index.search(q_emb, vec_search_k)
     vec_ranked = []
     for i, s in zip(I[0], D[0]):
         if i == -1:
             continue
         if allowed_ids is not None and i not in allowed_ids:
             continue
-        if sim_threshold > 0 and float(s) < sim_threshold:
+        if sim_threshold != 0 and float(s) < sim_threshold:
             continue
         vec_ranked.append(int(i))
-        if len(vec_ranked) >= k_vec:
+        if len(vec_ranked) >= max(k_vec, k_final):
             break
 
     bm_ranked = []
-    if data_store.bm25 is not None:
-        bm_scores = data_store.bm25.get_scores(tokenize(query))
+    if state.bm25 is not None:
+        bm_scores = state.bm25.get_scores(tokenize(query))
         bm_pool = max(k_bm25, k_final * 20, config.CROSS_RERANKER_TOPK * 3)
         for i in np.argsort(bm_scores)[::-1]:
             if bm_scores[i] <= 0:
@@ -104,7 +110,7 @@ def retrieve(query: str, k_vec: int = 8, k_bm25: int = 8, k_final: int = 6, sim_
             bm_ranked.append(int(i))
             if len(bm_ranked) >= bm_pool:
                 break
-        bm_ranked = bm_ranked[:k_bm25]
+        bm_ranked = bm_ranked[:max(k_bm25, k_final)]
 
     fused_scores = _rrf_scores(vec_ranked, bm_ranked)
     if not fused_scores:
@@ -115,7 +121,7 @@ def retrieve(query: str, k_vec: int = 8, k_bm25: int = 8, k_final: int = 6, sim_
 
     reranker = get_reranker()
     if reranker:
-        pairs = [[query, best_excerpt(query, data_store.corpus[i], max_chars=1000)] for i, _ in top_for_rerank]
+        pairs = [[query, best_excerpt(query, state.corpus[i], max_chars=1000)] for i, _ in top_for_rerank]
         rerank_scores = reranker.predict(pairs, batch_size=config.RERANKER_BATCH)
         ranked = sorted(zip([i for i, _ in top_for_rerank], rerank_scores), key=lambda x: x[1], reverse=True)
         top = _trim_weak_rerank_hits([(i, float(score)) for i, score in ranked], k_final)
@@ -123,11 +129,11 @@ def retrieve(query: str, k_vec: int = 8, k_bm25: int = 8, k_final: int = 6, sim_
         top = [(i, float(score)) for i, score in top_for_rerank[:k_final]]
 
     return [{
-        "id": data_store.rows[i]["id"],
-        "text": data_store.rows[i]["text"],
-        "excerpt": best_excerpt(query, data_store.rows[i]["text"]),
+        "id": state.rows[i]["id"],
+        "text": state.rows[i]["text"],
+        "excerpt": best_excerpt(query, state.rows[i]["text"]),
         "score": float(score),
-        "source": data_store.rows[i]["source"],
-        "kind": data_store.rows[i].get("kind"),
-        "meta": data_store.rows[i].get("meta", {}),
+        "source": state.rows[i]["source"],
+        "kind": state.rows[i].get("kind"),
+        "meta": state.rows[i].get("meta", {}),
     } for i, score in top]

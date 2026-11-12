@@ -5,10 +5,9 @@ from typing import Dict, List
 
 from pydantic import BaseModel
 
-from rag import data_store
 from common.formatters import file_to_document, site_to_documents
 from common.logger import get_logger
-
+from rag import data_store
 
 logger = get_logger("ingest")
 
@@ -18,7 +17,7 @@ def _log_site(message: str) -> None:
 
 
 def _stored_path(path: Path) -> str:
-    return str(path).replace("\\", "/")
+    return str(path.resolve()).replace("\\", "/")
 
 
 def _split_long_text(text: str, max_chars: int) -> List[str]:
@@ -94,22 +93,22 @@ def ingest_folder(folder: str, replace_existing: bool = False) -> int:
         if Path(p).suffix.lower() in supported_suffixes
     ]
     new_chunks: List[Dict] = []
+    processed_paths: set[str] = set()
     for fp in files:
         document = file_to_document(fp)
+        processed_paths.add(_stored_path(fp))
         if not document:
             continue
         for i, ch in enumerate(chunk_text(document.text)):
             new_chunks.append({
-                "id": f"doc:{document.source}:{i}",
+                "id": f"doc:{_stored_path(fp)}:{i}",
                 "text": ch,
                 "source": document.source,
                 "kind": document.kind,
-                "meta": document.meta
+                "meta": {**document.meta, "path": _stored_path(fp)}
             })
-    if not new_chunks:
-        return 0
-    if replace_existing:
-        return data_store.replace_chunks_by_paths({_stored_path(fp) for fp in files}, new_chunks)
+    if replace_existing and processed_paths:
+        return data_store.replace_chunks_by_paths(processed_paths, new_chunks)
     return data_store.add_chunks(new_chunks)
 
 
@@ -138,17 +137,17 @@ def crawl_site(cfg: CrawlConfig) -> int:
         )
         for i, ch in enumerate(chunks):
             all_chunks.append({
-                "id": f"site:{document.source}:{i}",
+                "id": f"{document.stable_id}:{i}",
                 "text": ch,
                 "source": document.source,
                 "kind": document.kind,
-                "meta": document.meta
+                "meta": {**document.meta, "document_id": document.stable_id}
             })
     if not all_chunks:
         _log_site("done added=0 reason=no_chunks")
         return 0
     before = len(data_store.rows)
-    added = data_store.add_chunks(all_chunks)
+    added = data_store.replace_chunks_by_documents({doc.stable_id for doc in documents}, all_chunks)
     after = len(data_store.rows)
     _log_site(f"done candidate_chunks={len(all_chunks)} added={added} before={before} after={after}")
     if added == 0 and all_chunks:
