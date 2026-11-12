@@ -115,7 +115,7 @@ def _stream_answer(
 
 
 async def ask(req: AskReq) -> AskResp | StreamingResponse:
-    from rag.retrieval import retrieve_async
+    from rag.retrieval import MIN_SEARCH_CANDIDATES, QueryTooLongError, retrieve_async
 
     query = _extract_query(req.messages)
     timestamp = datetime.now(timezone.utc).isoformat()
@@ -125,9 +125,14 @@ async def ask(req: AskReq) -> AskResp | StreamingResponse:
     )
 
     retrieve_start = time.time()
-    contexts = await retrieve_async(
-        query, req.top_k, req.top_k, req.top_k, config.RETRIEVAL_SIM_THRESHOLD, req.sources, req.site_domain,
-    )
+    candidate_count = max(MIN_SEARCH_CANDIDATES, req.top_k)
+    try:
+        contexts = await retrieve_async(
+            query, candidate_count, candidate_count, req.top_k,
+            config.RETRIEVAL_SIM_THRESHOLD, req.sources, req.site_domain,
+        )
+    except QueryTooLongError as e:
+        raise HTTPException(status_code=413, detail=str(e)) from e
     retrieve_elapsed = time.time() - retrieve_start
     logger.info("retrieve: contexts=%d elapsed=%.3fs", len(contexts), retrieve_elapsed)
 

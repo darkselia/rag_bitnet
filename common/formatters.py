@@ -7,7 +7,7 @@ from urllib.parse import urljoin, urldefrag
 
 import requests
 import tldextract
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString
 
 from common.logger import get_logger
 
@@ -48,9 +48,17 @@ def text_file_to_document(path: Path) -> Optional[FormattedDocument]:
 def html_to_text(html: str) -> str:
     try:
         soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
+        for tag in soup(["script", "style", "nav", "footer", "noscript"]):
             tag.decompose()
-        return re.sub(r"\s+", " ", soup.get_text(" ")).strip()
+        for header in soup.find_all("header"):
+            for heading in header.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+                header.insert_before(heading.extract())
+            header.decompose()
+        for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+            title = heading.get_text(" ", strip=True)
+            heading.replace_with(NavigableString(f"\n\n{'#' * int(heading.name[1])} {title}\n\n"))
+        text = re.sub(r"[^\S\n]+", " ", soup.get_text(" "))
+        return re.sub(r"\n\s*\n+", "\n\n", text).strip()
     except Exception:
         return ""
 

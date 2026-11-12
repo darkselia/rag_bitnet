@@ -58,7 +58,41 @@ def _word_safe_tail(text: str, overlap: int) -> str:
     return tail if idx == -1 else tail[idx + 1:]
 
 
-def chunk_text(text: str, max_chars: int = 1800, overlap: int = 200) -> List[str]:
+def _sections(text: str) -> List[str]:
+    lines = text.splitlines(keepends=True)
+    sections: List[str] = []
+    current: List[str] = []
+    fence_char = ""
+    fence_length = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip().lstrip("\ufeff")
+        fence = re.match(r"^\s{0,3}(`{3,}|~{3,})", line)
+        if fence:
+            marker = fence.group(1)
+            if not fence_char:
+                fence_char, fence_length = marker[0], len(marker)
+            elif marker[0] == fence_char and len(marker) >= fence_length and not line[fence.end():].strip():
+                fence_char = ""
+            current.append(line)
+            continue
+        blank_before = i == 0 or not lines[i - 1].strip()
+        blank_after = i + 1 == len(lines) or not lines[i + 1].strip()
+        markdown = bool(re.match(r"^\s{0,3}#{1,6}\s+\S", line.lstrip("\ufeff")))
+        uppercase = (
+                blank_before and blank_after and 3 <= len(stripped) <= 80
+                and len(stripped.split()) <= 12 and stripped.isupper()
+                and all(c.isalnum() or c.isspace() or c in "-–—:&'’" for c in stripped)
+        )
+        if not fence_char and (markdown or uppercase) and "".join(current).strip():
+            sections.append("".join(current))
+            current = []
+        current.append(line)
+    if current:
+        sections.append("".join(current))
+    return sections
+
+
+def _chunk_section(text: str, max_chars: int, overlap: int) -> List[str]:
     paras = []
     for p in re.split(r"\n{2,}", text):
         p = p.strip()
@@ -80,6 +114,10 @@ def chunk_text(text: str, max_chars: int = 1800, overlap: int = 200) -> List[str
     if cur:
         chunks.append(cur)
     return chunks
+
+
+def chunk_text(text: str, max_chars: int = 1800, overlap: int = 200) -> List[str]:
+    return [chunk for section in _sections(text) for chunk in _chunk_section(section, max_chars, overlap)]
 
 
 def ingest_folder(folder: str, replace_existing: bool = False) -> int:

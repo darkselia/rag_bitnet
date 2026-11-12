@@ -1,5 +1,6 @@
 from typing import Optional
 
+import torch
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from common import config
@@ -26,6 +27,16 @@ def get_reranker() -> Optional[CrossEncoder]:
         return None
     if _reranker is None:
         logger.info("[init] loading cross-encoder reranker %s on device %s", config.RERANKER_MODEL, _device)
-        _reranker = CrossEncoder(config.RERANKER_MODEL, device=_device)
+        model = CrossEncoder(config.RERANKER_MODEL, device=_device)
+        if config.RERANKER_QUANTIZE_CPU and _device == "cpu":
+            try:
+                torch.ao.quantization.quantize_dynamic(model.model, {torch.nn.Linear}, dtype=torch.qint8, inplace=True)
+                logger.info("[init] CPU reranker quantization enabled")
+            except (RuntimeError, NotImplementedError) as e:
+                logger.warning("[init] reranker quantization failed; loading original model: %s", e)
+                model = None
+        if model is None:
+            model = CrossEncoder(config.RERANKER_MODEL, device=_device)
+        _reranker = model
     return _reranker
 

@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
 import numpy as np
@@ -10,6 +10,11 @@ from rag import data_store
 
 RRF_K = 60.0
 RERANK_RELATIVE_KEEP = 0.25
+MIN_SEARCH_CANDIDATES = 6
+
+
+class QueryTooLongError(ValueError):
+    pass
 
 
 async def retrieve_async(query: str, k_vec: int = 8, k_bm25: int = 8, k_final: int = 6, sim_threshold: float = 0.0,
@@ -62,6 +67,61 @@ def _trim_weak_rerank_hits(ranked: List[tuple[int, float]], k_final: int) -> Lis
     threshold = best_score * RERANK_RELATIVE_KEEP
     kept = [item for item in top if item[1] >= threshold]
     return kept or top[:1]
+
+
+def _rerank(query: str, candidates: List[tuple[int, float]], corpus: List[str], reranker: Any) -> List[
+    tuple[int, float]]:
+    tokenizer = reranker.tokenizer
+    limit = min(tokenizer.model_max_length, reranker.max_length or tokenizer.model_max_length)
+    model_config = getattr(getattr(reranker, "model", None), "config", None)
+    position_limit = getattr(model_config, "max_position_embeddings", None)
+    if isinstance(position_limit, int) and position_limit > 0:
+        limit = min(limit, position_limit)
+    query_tokens = len(tokenizer.encode(query, add_special_tokens=False))
+    available = limit - query_tokens - tokenizer.num_special_tokens_to_add(pair=True)
+    if available <= 0:
+        raise QueryTooLongError("Question exceeds the reranker token limit")
+
+    pairs: List[list[str]] = []
+    owners: List[int] = []
+    for idx, _ in candidates:
+        text = corpus[idx]
+        pair_tokens = tokenizer(query, text, add_special_tokens=True, truncation=False)["input_ids"]
+        if len(pair_tokens) <= limit:
+            windows = [text]
+        else:
+            if not tokenizer.is_fast:
+                raise ValueError("A fast tokenizer is required to split oversized reranker inputs")
+            offsets = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True, truncation=False)[
+                "offset_mapping"]
+            if not offsets:
+                raise QueryTooLongError("Question leaves no room for context")
+            windows = []
+            start = 0
+            while start < len(offsets):
+                end = min(start + available, len(offsets))
+                begin_char = 0 if start == 0 else offsets[start][0]
+                while end > start:
+                    end_char = len(text) if end == len(offsets) else max(offsets[end][0], offsets[end - 1][1])
+                    window = text[begin_char:end_char]
+                    size = len(tokenizer(query, window, add_special_tokens=True, truncation=False)["input_ids"])
+                    if window and size <= limit:
+                        break
+                    end -= max(1, size - limit)
+                if end <= start:
+                    raise QueryTooLongError("Question leaves no room for a complete text token")
+                windows.append(window)
+                if end == len(offsets):
+                    break
+                start = max(start + 1, end - min(64, available // 4))
+        pairs.extend([[query, window] for window in windows])
+        owners.extend([idx] * len(windows))
+
+    scores = reranker.predict(pairs, batch_size=config.RERANKER_BATCH)
+    best: dict[int, float] = {}
+    for idx, score in zip(owners, scores):
+        best[idx] = max(best.get(idx, float("-inf")), float(score))
+    return sorted(best.items(), key=lambda item: item[1], reverse=True)
 
 
 def retrieve(query: str, k_vec: int = 8, k_bm25: int = 8, k_final: int = 6, sim_threshold: float = 0.0,
@@ -121,10 +181,8 @@ def retrieve(query: str, k_vec: int = 8, k_bm25: int = 8, k_final: int = 6, sim_
 
     reranker = get_reranker()
     if reranker:
-        pairs = [[query, best_excerpt(query, state.corpus[i], max_chars=1000)] for i, _ in top_for_rerank]
-        rerank_scores = reranker.predict(pairs, batch_size=config.RERANKER_BATCH)
-        ranked = sorted(zip([i for i, _ in top_for_rerank], rerank_scores), key=lambda x: x[1], reverse=True)
-        top = _trim_weak_rerank_hits([(i, float(score)) for i, score in ranked], k_final)
+        ranked = _rerank(query, top_for_rerank, state.corpus, reranker)
+        top = _trim_weak_rerank_hits(ranked, k_final)
     else:
         top = [(i, float(score)) for i, score in top_for_rerank[:k_final]]
 
