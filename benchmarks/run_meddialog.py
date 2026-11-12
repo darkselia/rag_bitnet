@@ -20,6 +20,7 @@ TASKS = [
 def run(limit: int | None = None, model: str | None = None) -> dict | None:
     lm = BitNetLM()
     results = None
+    failed = []
 
     for task in TASKS:
         print(f"\n{'=' * 60}")
@@ -35,21 +36,25 @@ def run(limit: int | None = None, model: str | None = None) -> dict | None:
                 limit=limit,
             )
         except NotImplementedError as e:
-            print(f"  SKIP ({e})")
+            print(f"  FAIL ({e})")
+            failed.append(task)
             continue
         except Exception as e:
-            print(f"  SKIP ({type(e).__name__}: {e})")
+            print(f"  FAIL ({type(e).__name__}: {e})")
+            failed.append(task)
             traceback.print_exc()
             continue
 
         json_path, summary_path = save_results(
             results, stem=f"results_{task}",
             output_dir=Path("logs/benchmarks") / "meddialog",
-            model_name=model,
+            model_name=model, model=lm, limit=limit,
         )
         print(summary_path.read_text(encoding="utf-8"))
         print(f"Results saved to {json_path.parent}")
 
+    if failed:
+        raise RuntimeError("Failed MedDialog tasks: " + ", ".join(failed))
     return results
 
 

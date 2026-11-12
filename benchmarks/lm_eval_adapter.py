@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from typing import Any
 
 import requests
@@ -31,6 +30,7 @@ class BitNetLM(LM):
         self._timeout = timeout or config.BITNET_TIMEOUT
         self._batch_size = batch_size
         self._base_url = f"http://{self._host}:{self._port}"
+        self.model_name: str | None = None
         logger.info(
             "BitNetLM: mode=%s host=%s port=%d timeout=%d",
             self._mode, self._host, self._port, self._timeout,
@@ -84,15 +84,35 @@ class BitNetLM(LM):
     def _call_api(self, payload: dict[str, Any]) -> dict[str, Any]:
         resp = requests.post(self._completion_url, json=payload, timeout=self._timeout)
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+        model = data.get("model")
+        if model:
+            if self.model_name and self.model_name != model:
+                raise ValueError("Server model changed during the benchmark")
+            self.model_name = model
+        return data
+
+    def model_identity(self) -> dict[str, Any]:
+        try:
+            response = requests.get(f"{self._base_url}/v1/models", timeout=self._timeout)
+            response.raise_for_status()
+            models = response.json()["data"]
+            ids = [item["id"] for item in models if isinstance(item, dict) and isinstance(item.get("id"), str)]
+            actual = ids[0] if len(ids) == 1 else None
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            actual = None
+        return {"server_model": actual, "response_model": self.model_name,
+                "server_model_verified": actual is not None and actual == self.model_name}
 
     def _extract_text(self, data: dict[str, Any]) -> str:
         if self._mode == "completion":
-            return data.get("content", "")
+            if data.get("truncated"):
+                raise ValueError("Server truncated the benchmark prompt")
+            return data["content"]
         choices = data.get("choices", [])
         if not choices:
-            return ""
-        return choices[0].get("message", {}).get("content", "")
+            raise ValueError("Server returned no choices")
+        return choices[0]["message"]["content"]
 
     def generate_until(self, requests: list[Instance]) -> list[str]:
         results: list[str] = []
@@ -104,54 +124,15 @@ class BitNetLM(LM):
                 "  [%d/%d] context_len=%d gen_kwargs=%s",
                 i + 1, len(requests), len(context), gen_kwargs,
             )
-            try:
-                data = self._call_api(payload)
-                text = self._extract_text(data)
-            except requests.exceptions.ConnectionError:
-                logger.error("Cannot connect to BitNet server at %s", self._base_url)
-                text = ""
-            except Exception as exc:
-                logger.warning("  request %d failed: %s", i + 1, exc)
-                text = ""
-            text = re.sub(r"\s+", " ", text).strip()
+            data = self._call_api(payload)
+            text = self._extract_text(data)
+            if not isinstance(text, str) or not text:
+                raise ValueError(f"Empty response for benchmark request {i + 1}")
             results.append(text)
         return results
 
     def loglikelihood(self, requests: list[Instance]) -> list[tuple[float, bool]]:
-        _gen_cache: dict[str, str] = {}
-        results: list[tuple[float, bool]] = []
-        logger.info("loglikelihood: %d requests", len(requests))
-
-        for req in requests:
-            context, continuation = req.args
-
-            if context not in _gen_cache:
-                payload = self._build_payload(context, {
-                    "max_gen_toks": 10,
-                    "do_sample": False,
-                    "temperature": 0.0,
-                })
-                try:
-                    data = self._call_api(payload)
-                    _gen_cache[context] = self._extract_text(data).strip()
-                except Exception as exc:
-                    logger.warning("loglikelihood generate failed: %s", exc)
-                    _gen_cache[context] = ""
-
-            gen_text = _gen_cache[context]
-            cont_clean = continuation.strip()
-
-            if gen_text.startswith(cont_clean):
-                results.append((0.0, True))
-            else:
-                results.append((-100.0, False))
-
-            logger.info(
-                "loglikelihood: continuation=%r generated=%r match=%s",
-                cont_clean, gen_text, gen_text.startswith(cont_clean),
-            )
-
-        return results
+        raise NotImplementedError("True per-token loglikelihood is not supported by this adapter")
 
     def loglikelihood_rolling(self, requests: list[Instance]) -> list[tuple[float, bool]]:
         raise NotImplementedError(
