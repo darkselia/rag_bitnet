@@ -136,6 +136,8 @@ RETRIEVAL_SIM_THRESHOLD = _env_float("RETRIEVAL_SIM_THRESHOLD", 0.0, min_value=-
 API_HOST = _env_str("API_HOST", "127.0.0.1")
 API_PORT = _env_int("API_PORT", 8000, min_value=1)
 RAG_API_KEY = _env_str("RAG_API_KEY", "")
+MAX_CONCURRENT_ASK = _env_int("MAX_CONCURRENT_ASK", 1, min_value=1)
+CPU_THREADS = _env_int("CPU_THREADS", 4, min_value=1)
 
 CORPUS_JSONL = DATA_DIR / "rows.jsonl"
 EMB_NPY = DATA_DIR / "embeddings.npy"

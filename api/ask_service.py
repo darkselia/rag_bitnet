@@ -1,4 +1,5 @@
 import json
+import threading
 import time
 from collections.abc import Iterator
 from datetime import datetime, timezone
@@ -17,6 +18,25 @@ from schemas.app_schema import AskReq, AskResp, LLMResp, Message
 
 logger = get_logger("ask_service")
 NO_CONTEXT_ANSWER = "Couldn't find the answer in the database."
+
+
+class _TrackedStream:
+    def __init__(self, pieces: Iterator[LLMResp]) -> None:
+        self.pieces = pieces
+        self.lock = threading.Lock()
+
+    def __iter__(self) -> Iterator[LLMResp]:
+        return self
+
+    def __next__(self) -> LLMResp:
+        with self.lock:
+            return next(self.pieces)
+
+    def close(self) -> None:
+        with self.lock:
+            close = getattr(self.pieces, "close", None)
+            if close is not None:
+                close()
 
 CSV_FIELDS = [
     "operation_id", "timestamp", "retrieve time", "user question", "contest",
@@ -201,7 +221,8 @@ async def ask(req: AskReq) -> AskResp | StreamingResponse:
         logger.info("stream: started")
         llm_start = time.monotonic()
         operation_update(_generation_started=llm_start)
-        pieces = llm.generate_stream(messages, config.LLM_MAX_TOKENS, req.temperature, context=ctx_text)
+        pieces = _TrackedStream(llm.generate_stream(messages, config.LLM_MAX_TOKENS, req.temperature, context=ctx_text))
+        operation_update(_stream=pieces)
         try:
             first = await run_in_threadpool(next, pieces, None)
         except requests.Timeout as e:

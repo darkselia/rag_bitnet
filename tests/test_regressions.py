@@ -128,6 +128,146 @@ async def asgi_request(
 
 
 class RegressionTests(unittest.TestCase):
+    def test_model_initialization_is_single_and_uses_cpu(self):
+        from concurrent.futures import ThreadPoolExecutor
+        embed = unittest.mock.MagicMock()
+        reranker = unittest.mock.MagicMock()
+        with patch.object(models, "_embed_model", None), patch.object(models, "_reranker", None), \
+                patch.object(config, "USE_CROSS_RERANKER", True), patch.object(config, "RERANKER_QUANTIZE_CPU", False), \
+                patch("rag.models.SentenceTransformer", return_value=embed) as load_embed, \
+                patch("rag.models.CrossEncoder", return_value=reranker) as load_reranker:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                self.assertTrue(
+                    all(value is embed for value in pool.map(lambda _: models.get_embed_model(), range(16))))
+                self.assertTrue(
+                    all(value is reranker for value in pool.map(lambda _: models.get_reranker(), range(16))))
+            load_embed.assert_called_once_with(config.EMBED_MODEL, device="cpu")
+            load_reranker.assert_called_once_with(config.RERANKER_MODEL, device="cpu")
+
+    def test_ingest_capacity_is_shared_and_released_after_error(self):
+        async def exercise():
+            started, release = asyncio.Event(), asyncio.Event()
+            statuses = []
+
+            async def inner(scope, receive, send):
+                started.set()
+                await release.wait()
+                raise RuntimeError("failed")
+
+            async def receive():
+                await asyncio.Event().wait()
+
+            async def send(message):
+                if message["type"] == "http.response.start":
+                    statuses.append(message["status"])
+
+            middleware = OperationMiddleware(inner)
+            scope = {"type": "http", "method": "POST", "path": "/ingest/files",
+                     "headers": [(b"x-api-key", b"test-secret")]}
+            site = {**scope, "path": "/ingest/site"}
+            with patch.object(config, "RAG_API_KEY", "test-secret"), \
+                    patch("api.server._ingest_limit", threading.BoundedSemaphore(1)), patch("api.server.log_operation"):
+                task = asyncio.create_task(middleware(scope, receive, send))
+                await started.wait()
+                await middleware(site, receive, send)
+                self.assertEqual(statuses, [503])
+                release.set()
+                with self.assertRaises(RuntimeError):
+                    await task
+                with self.assertRaises(RuntimeError):
+                    await middleware(site, receive, send)
+
+        asyncio.run(exercise())
+
+    def test_capacity_limits_hold_for_stream_and_release_on_cancel(self):
+        async def exercise():
+            started = asyncio.Queue()
+            release = asyncio.Event()
+            events = []
+
+            async def inner(scope, receive, send):
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+                await send({"type": "http.response.body", "body": b"chunk", "more_body": True})
+                await started.put(None)
+                await release.wait()
+                await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+            async def receive():
+                await asyncio.Event().wait()
+
+            async def send(message):
+                events.append(message)
+
+            scope = {"type": "http", "method": "POST", "path": "/ask", "headers": [(b"x-api-key", b"test-secret")]}
+            middleware = OperationMiddleware(inner)
+            with patch.object(config, "RAG_API_KEY", "test-secret"), \
+                    patch("api.server._ask_limit", threading.BoundedSemaphore(2)), \
+                    patch("api.server.log_operation"):
+                first = asyncio.create_task(middleware(scope, receive, send))
+                second = asyncio.create_task(middleware(scope, receive, send))
+                await started.get()
+                await started.get()
+                await middleware(scope, receive, send)
+                self.assertEqual([e["status"] for e in events if e["type"] == "http.response.start"], [200, 200, 503])
+                first.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await first
+                third = asyncio.create_task(middleware(scope, receive, send))
+                await started.get()
+                release.set()
+                await asyncio.gather(second, third)
+                self.assertEqual([e["status"] for e in events if e["type"] == "http.response.start"][-1], 200)
+
+        asyncio.run(exercise())
+
+    def test_stream_cleanup_waits_for_active_read_before_releasing_capacity(self):
+        from api.ask_service import _TrackedStream
+        from common.logger import operation_update
+        entered, unblock, closed = threading.Event(), threading.Event(), threading.Event()
+
+        def pieces():
+            try:
+                entered.set()
+                unblock.wait(10)
+                yield LLMResp(content="part")
+            finally:
+                closed.set()
+
+        stream = _TrackedStream(pieces())
+        reader = threading.Thread(target=lambda: next(stream))
+
+        async def exercise():
+            async def inner(scope, receive, send):
+                operation_update(_stream=stream)
+                reader.start()
+                self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+
+            async def receive():
+                await asyncio.Event().wait()
+
+            async def send(message):
+                pass
+
+            scope = {"type": "http", "method": "POST", "path": "/ask", "headers": [(b"x-api-key", b"test-secret")]}
+            semaphore = threading.BoundedSemaphore(1)
+            with patch.object(config, "RAG_API_KEY", "test-secret"), \
+                    patch("api.server._ask_limit", semaphore), patch("api.server.log_operation"):
+                task = asyncio.create_task(OperationMiddleware(inner)(scope, receive, send))
+                self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+                await asyncio.sleep(0.05)
+                self.assertFalse(semaphore.acquire(blocking=False))
+                unblock.set()
+                await task
+                self.assertTrue(closed.is_set())
+                self.assertTrue(semaphore.acquire(blocking=False))
+                semaphore.release()
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            unblock.set()
+            reader.join(5)
+
     def test_operation_log_connects_ask_events_without_content(self):
         events, csv_rows, headers = [], [], []
         secret = "private-question-and-key"
@@ -213,6 +353,7 @@ class RegressionTests(unittest.TestCase):
             return await asyncio.gather(*(asgi_request("POST", "/ask", payload, "test-secret") for _ in range(20)))
 
         with patch.object(config, "RAG_API_KEY", "test-secret"), \
+                patch("api.server._ask_limit", threading.BoundedSemaphore(20)), \
                 patch("api.server.log_operation", side_effect=lambda event: events.append(event.copy())), \
                 patch("api.ask_service._log_csv"), \
                 patch("rag.retrieval.retrieve_async", new_callable=AsyncMock, return_value=[]):
