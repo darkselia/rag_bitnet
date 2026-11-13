@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import numpy as np
+import requests
 from docx import Document
 from fastapi import HTTPException
 from pypdf import PdfWriter
@@ -19,7 +20,7 @@ _data = tempfile.TemporaryDirectory()
 os.environ["DATA_DIR"] = _data.name
 os.environ["LOG_REQUEST_CONTENT"] = "false"
 
-from api.ask_service import _stream_answer, ask
+from api.ask_service import NO_CONTEXT_ANSWER, _stream_answer, ask
 from api.server import app, startup_event
 from benchmarks.lm_eval_adapter import BitNetLM
 from benchmarks.run_medqa import extract_answer
@@ -28,7 +29,7 @@ from common import config
 from common.formatters import file_to_document, html_to_text
 from rag import data_store, models
 from rag.ingest import chunk_text, ingest_folder
-from rag.retrieval import QueryTooLongError, _allowed_indices, _rerank
+from rag.retrieval import QueryTooLongError, _allowed_indices, _rerank, retrieve
 from schemas.app_schema import AskReq, LLMResp, Message
 
 
@@ -384,12 +385,123 @@ class RegressionTests(unittest.TestCase):
         with self.assertRaises(QueryTooLongError):
             _rerank(" ".join(["q"] * 9), [(0, 0.0)], ["text"], FakeReranker())
 
+    def test_reranker_min_score_filters_fused_candidates_and_enables_fallback(self):
+        rows = [
+            {"id": "first", "text": "first text", "source": "one", "kind": "docs"},
+            {"id": "second", "text": "second text", "source": "two", "kind": "docs"},
+        ]
+        index = unittest.mock.MagicMock()
+        index.search.return_value = (np.array([[0.9, 0.8]], dtype="float32"), np.array([[0, 1]]))
+        bm25 = unittest.mock.MagicMock()
+        bm25.get_scores.return_value = np.array([1.0, 0.5])
+        state = data_store.Snapshot(rows, [row["text"] for row in rows], index, bm25)
+        with patch("rag.data_store.snapshot", return_value=state), \
+                patch("rag.models.get_embed_model", return_value=FakeEmbedding()), \
+                patch("rag.models.get_reranker", return_value=object()), \
+                patch("rag.retrieval._rerank", return_value=[(0, 0.09), (1, 0.04)]):
+            with patch.object(config, "RERANKER_MIN_SCORE", None):
+                self.assertEqual([row["id"] for row in retrieve("question", k_final=2)], ["first", "second"])
+            with patch.object(config, "RERANKER_MIN_SCORE", 0.05):
+                self.assertEqual([row["id"] for row in retrieve("question", k_final=2)], ["first"])
+            with patch.object(config, "RERANKER_MIN_SCORE", 0.1), \
+                    patch.object(config, "RAG_API_KEY", "test-secret"), \
+                    patch("api.ask_service.get_llm") as get_llm, patch("api.ask_service._log_csv"):
+                self.assertEqual(retrieve("question", k_final=2), [])
+                payload = {"messages": [{"role": "user", "content": "question"}]}
+                status, body = asyncio.run(asgi_request("POST", "/ask", payload, "test-secret"))
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body)["answer"]["content"], NO_CONTEXT_ANSWER)
+                get_llm.assert_not_called()
+
     def test_ask_uses_six_candidates_per_method_for_top_one(self):
-        with patch("rag.retrieval.retrieve_async", new_callable=AsyncMock, return_value=[]) as retrieve:
-            with self.assertRaises(HTTPException) as error:
-                asyncio.run(ask(AskReq(messages=[Message(role="user", content="question")], top_k=1)))
-        self.assertEqual(error.exception.status_code, 404)
+        with patch("rag.retrieval.retrieve_async", new_callable=AsyncMock, return_value=[]) as retrieve, \
+                patch("api.ask_service.get_llm") as get_llm, patch("api.ask_service._log_csv"):
+            response = asyncio.run(ask(AskReq(messages=[Message(role="user", content="question")], top_k=1)))
+        self.assertEqual(response.answer.content, NO_CONTEXT_ANSWER)
+        self.assertEqual(response.used_context, [])
+        get_llm.assert_not_called()
         self.assertEqual(retrieve.call_args.args[1:4], (6, 6, 1))
+
+    def test_empty_context_returns_matching_json_and_ndjson_without_llm(self):
+        with patch.object(config, "RAG_API_KEY", "test-secret"), \
+                patch("rag.retrieval.retrieve_async", new_callable=AsyncMock, return_value=[]), \
+                patch("api.ask_service.get_llm") as get_llm, patch("api.ask_service._log_csv") as log:
+            for stream in (False, True):
+                payload = {"messages": [{"role": "user", "content": "question"}], "stream": stream}
+                status, body = asyncio.run(asgi_request("POST", "/ask", payload, "test-secret"))
+                self.assertEqual(status, 200)
+                events = [json.loads(line) for line in body.splitlines()]
+                self.assertEqual(events[-1]["answer"]["content"], NO_CONTEXT_ANSWER)
+                self.assertEqual(events[-1]["used_context"], [])
+                self.assertIsNone(events[-1]["timings"])
+                if stream:
+                    self.assertEqual(len(events), 2)
+                    self.assertEqual(events[0]["content"], NO_CONTEXT_ANSWER)
+                else:
+                    self.assertEqual(len(events), 1)
+            self.assertEqual(log.call_count, 2)
+            get_llm.assert_not_called()
+
+    def test_context_window_removes_chunks_and_never_generates_without_context(self):
+        contexts = [{"id": "first", "text": "first"}, {"id": "second", "text": "second"}]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                llm = unittest.mock.MagicMock()
+                llm.count_prompt_tokens.side_effect = [300, 250, 100]
+                payload = {"messages": [{"role": "user", "content": "question"}], "stream": stream}
+                with patch.object(config, "RAG_API_KEY", "test-secret"), \
+                        patch.object(config, "BITNET_CONTEXT_SIZE", 200), \
+                        patch.object(config, "LLM_MAX_TOKENS", 20), \
+                        patch("rag.retrieval.retrieve_async", new_callable=AsyncMock, return_value=contexts.copy()), \
+                        patch("api.ask_service.get_llm", return_value=llm), patch("api.ask_service._log_csv"):
+                    status, body = asyncio.run(asgi_request("POST", "/ask", payload, "test-secret"))
+                self.assertEqual(status, 200)
+                events = [json.loads(line) for line in body.splitlines()]
+                self.assertEqual(events[-1]["answer"]["content"], NO_CONTEXT_ANSWER)
+                self.assertEqual(events[-1]["used_context"], [])
+                self.assertEqual(llm.count_prompt_tokens.call_args_list[-1].args[1], "")
+                llm.generate.assert_not_called()
+                llm.generate_stream.assert_not_called()
+
+    def test_context_window_preserves_fitting_chunks_or_returns_413(self):
+        contexts = [{"id": "first", "text": "first"}, {"id": "second", "text": "second"}]
+        llm = unittest.mock.MagicMock()
+        llm.count_prompt_tokens.side_effect = [300, 100]
+        llm.generate.return_value = LLMResp(content="answer")
+        req = AskReq(messages=[Message(role="user", content="question")])
+        with patch.object(config, "BITNET_CONTEXT_SIZE", 200), patch.object(config, "LLM_MAX_TOKENS", 20), \
+                patch("rag.retrieval.retrieve_async", new_callable=AsyncMock, return_value=contexts.copy()), \
+                patch("api.ask_service.get_llm", return_value=llm), patch("api.ask_service._log_csv"):
+            response = asyncio.run(ask(req))
+        self.assertEqual(response.used_context, contexts[:1])
+        self.assertEqual(llm.generate.call_args.kwargs["context"], "[first]\nfirst")
+
+        llm.reset_mock()
+        llm.count_prompt_tokens.side_effect = [300, 300, 300]
+        with patch.object(config, "BITNET_CONTEXT_SIZE", 200), patch.object(config, "LLM_MAX_TOKENS", 20), \
+                patch("rag.retrieval.retrieve_async", new_callable=AsyncMock, return_value=contexts.copy()), \
+                patch("api.ask_service.get_llm", return_value=llm), patch("api.ask_service._log_csv"):
+            with self.assertRaises(HTTPException) as error:
+                asyncio.run(ask(req))
+        self.assertEqual(error.exception.status_code, 413)
+        llm.generate.assert_not_called()
+        llm.generate_stream.assert_not_called()
+
+    def test_context_window_reports_tokenization_errors(self):
+        contexts = [{"id": "first", "text": "first"}]
+        req = AskReq(messages=[Message(role="user", content="question")])
+        for error, status in ((requests.Timeout("timeout"), 504), (requests.HTTPError("not found"), 502)):
+            with self.subTest(status=status):
+                llm = unittest.mock.MagicMock()
+                llm.count_prompt_tokens.side_effect = error
+                with patch.object(config, "BITNET_CONTEXT_SIZE", 200), \
+                        patch("rag.retrieval.retrieve_async", new_callable=AsyncMock, return_value=contexts.copy()), \
+                        patch("api.ask_service.get_llm", return_value=llm), patch("api.ask_service._log_csv"):
+                    with self.assertRaises(HTTPException) as exc:
+                        asyncio.run(ask(req))
+                self.assertEqual(exc.exception.status_code, status)
+                llm.generate.assert_not_called()
+                llm.generate_stream.assert_not_called()
 
     def test_ask_returns_413_for_overlong_reranker_question(self):
         with patch("rag.retrieval.retrieve_async", new_callable=AsyncMock,

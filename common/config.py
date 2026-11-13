@@ -1,3 +1,4 @@
+import math
 import os
 import time
 from pathlib import Path
@@ -92,6 +93,14 @@ CROSS_RERANKER_TOPK = _env_int("CROSS_RERANKER_TOPK", 12, min_value=1)
 EMBED_BATCH = _env_int("EMBED_BATCH", 64, min_value=1)
 RERANKER_BATCH = _env_int("RERANKER_BATCH", 1, min_value=1)
 RERANKER_QUANTIZE_CPU = _env_bool("RERANKER_QUANTIZE_CPU", True)
+RERANKER_MIN_SCORE: float | None = (
+    _env_float("RERANKER_MIN_SCORE", 0.0) if _env_str("RERANKER_MIN_SCORE", "") else None
+)
+if RERANKER_MIN_SCORE is not None:
+    if not math.isfinite(RERANKER_MIN_SCORE):
+        raise ValueError("RERANKER_MIN_SCORE must be finite")
+    if not USE_CROSS_RERANKER:
+        raise ValueError("RERANKER_MIN_SCORE requires USE_CROSS_RERANKER=true")
 
 LLM_PROVIDER = _env_str("LLM_PROVIDER", "BITNET").lower()
 LLM_MAX_TOKENS = _env_int("LLM_MAX_TOKENS", 300, min_value=1)

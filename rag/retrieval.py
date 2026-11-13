@@ -182,6 +182,8 @@ def retrieve(query: str, k_vec: int = 8, k_bm25: int = 8, k_final: int = 6, sim_
     reranker = get_reranker()
     if reranker:
         ranked = _rerank(query, top_for_rerank, state.corpus, reranker)
+        if config.RERANKER_MIN_SCORE is not None:
+            ranked = [(i, score) for i, score in ranked if score >= config.RERANKER_MIN_SCORE]
         top = _trim_weak_rerank_hits(ranked, k_final)
     else:
         top = [(i, float(score)) for i, score in top_for_rerank[:k_final]]
