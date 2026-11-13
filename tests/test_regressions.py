@@ -9,15 +9,18 @@ from unittest.mock import AsyncMock, patch
 
 import numpy as np
 from fastapi import HTTPException
+from starlette.responses import StreamingResponse
 
 _data = tempfile.TemporaryDirectory()
 os.environ["DATA_DIR"] = _data.name
 os.environ["LOG_REQUEST_CONTENT"] = "false"
 
 from api.ask_service import _stream_answer, ask
+from api.server import app, startup_event
 from benchmarks.lm_eval_adapter import BitNetLM
 from benchmarks.run_medqa import extract_answer
 from clients.bitnet_client import BitNetAPI
+from common import config
 from common.formatters import html_to_text
 from rag import data_store, models
 from rag.ingest import chunk_text, ingest_folder
@@ -56,7 +59,93 @@ class FakeReranker:
         return [1.0 if "needle" in text else 0.1 for _, text in pairs]
 
 
+async def asgi_request(
+        method: str, path: str, payload: dict | None = None, api_key: str | None = None,
+) -> tuple[int, bytes]:
+    headers = [(b"content-type", b"application/json")]
+    if api_key is not None:
+        headers.append((b"x-api-key", api_key.encode("latin-1")))
+    body = json.dumps(payload).encode("utf-8") if payload is not None else b""
+    scope = {
+        "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1", "method": method, "scheme": "http", "path": path,
+        "raw_path": path.encode("ascii"), "query_string": b"", "headers": headers,
+        "server": ("testserver", 80), "client": ("testclient", 123), "root_path": "",
+    }
+    events: list[dict] = []
+    received = False
+
+    async def receive() -> dict:
+        nonlocal received
+        if not received:
+            received = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await asyncio.Event().wait()
+        return {"type": "http.disconnect"}
+
+    async def send(event: dict) -> None:
+        events.append(event)
+
+    await app(scope, receive, send)
+    status = next(event["status"] for event in events if event["type"] == "http.response.start")
+    content = b"".join(event.get("body", b"") for event in events if event["type"] == "http.response.body")
+    return status, content
+
+
 class RegressionTests(unittest.TestCase):
+    def test_api_key_is_required_at_startup(self):
+        with patch.object(config, "RAG_API_KEY", ""):
+            with self.assertRaisesRegex(RuntimeError, "RAG_API_KEY"):
+                asyncio.run(startup_event())
+        with patch.object(config, "RAG_API_KEY", "test-secret"):
+            asyncio.run(startup_event())
+
+    def test_api_key_protects_all_routes(self):
+        cases = [
+            ("/ask", {"messages": [{"role": "user", "content": "question"}]}, "api.routes.ask_service.ask"),
+            ("/ask", {"messages": [{"role": "user", "content": "question"}], "stream": True},
+             "api.routes.ask_service.ask"),
+            ("/ingest/files", {"folder": "data/rag_docs"}, "api.routes.ingest_service.ingest_files"),
+            ("/ingest/site", {"base_url": "https://example.com"}, "api.routes.ingest_service.ingest_site"),
+        ]
+        with patch.object(config, "RAG_API_KEY", "test-secret"):
+            for path, payload, target in cases:
+                for key in (None, "", "wrong-secret", "\u00e9"):
+                    with self.subTest(path=path, stream=payload.get("stream"), key=key), \
+                            patch(target, new_callable=AsyncMock) as service:
+                        status, body = asyncio.run(asgi_request("POST", path, payload, key))
+                        self.assertEqual(status, 401)
+                        self.assertNotIn(b"test-secret", body)
+                        self.assertNotIn(b"wrong-secret", body)
+                        service.assert_not_awaited()
+                with self.subTest(path=path, stream=payload.get("stream"), key="valid"), \
+                        patch(target, new_callable=AsyncMock, return_value={"ok": True}) as service:
+                    status, body = asyncio.run(asgi_request("POST", path, payload, "test-secret"))
+                    self.assertEqual(status, 200)
+                    self.assertEqual(json.loads(body), {"ok": True})
+                    service.assert_awaited_once()
+        with patch.object(config, "RAG_API_KEY", ""):
+            status, _ = asyncio.run(asgi_request("POST", "/ingest/files", {"folder": "x"}, "test-secret"))
+            self.assertEqual(status, 401)
+
+    def test_api_key_allows_streaming_and_is_documented(self):
+        payload = {"messages": [{"role": "user", "content": "question"}], "stream": True}
+        response = StreamingResponse(iter([b'{"content":"ok"}\n']), media_type="application/x-ndjson")
+        with patch.object(config, "RAG_API_KEY", "test-secret"), \
+                patch("api.routes.ask_service.ask", new_callable=AsyncMock, return_value=response):
+            status, body = asyncio.run(asgi_request("POST", "/ask", payload, "test-secret"))
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"content": "ok"})
+
+        status, body = asyncio.run(asgi_request("GET", "/openapi.json"))
+        self.assertEqual(status, 200)
+        schema = json.loads(body)
+        self.assertEqual(schema["components"]["securitySchemes"]["APIKeyHeader"]["name"], "X-API-Key")
+        for path in ("/ask", "/ingest/files", "/ingest/site"):
+            self.assertIn({"APIKeyHeader": []}, schema["paths"][path]["post"]["security"])
+        status, _ = asyncio.run(asgi_request("GET", "/docs"))
+        self.assertEqual(status, 200)
+
     def test_reranker_cpu_quantization_is_configurable(self):
         model = unittest.mock.MagicMock()
         with patch.object(models, "_reranker", None), patch.object(models.config, "USE_CROSS_RERANKER", True), \

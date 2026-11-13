@@ -11,16 +11,21 @@ FastAPI-сервис для RAG-чата поверх локальных док�
 - Два режима LLM: **chat** (`/v1/chat/completions`) и **completion** (`/completion`) — переключаются через
   `BITNET_MODE`.
 - JSON и ndjson-streaming ответы через `/ask` (поток из чанков + финальный `AskResp`).
+- Общий ключ доступа к API через заголовок `X-API-Key`.
 - CSV-логирование всех RAG-запросов с таймингами retrieve/LLM.
 
 ## Быстрый старт
 
 ```bash
 cp .env.example .env
+# Создайте случайный ключ и запишите его в RAG_API_KEY в .env:
+python -c "import secrets; print(secrets.token_urlsafe(32))"
 pip install -r requirements.txt        # RAG API
 pip install -r requirements-bench.txt  # + benchmarks (опционально)
-python main.py || uvicorn api.server:app --host 0.0.0.0 --port 8000
+python main.py
 ```
+
+При пустом или отсутствующем `RAG_API_KEY` API не запустится. Перезапустите сервис после изменения ключа.
 
 BitNet inference server: https://github.com/microsoft/BitNet
 
@@ -34,10 +39,14 @@ docker build -f docker/Dockerfile -t rag-bitnet:latest .
 
 Запуск с внешней папкой BitNet:
 
+Перед запуском задайте `RAG_API_KEY` в окружении запускающего shell; Docker передаст его в контейнер.
+
 ```bash
-docker run --rm -p 127.0.0.1:8000:8000 -p 127.0.0.1:8080:8080 \
+docker run --rm -p 127.0.0.1:8000:8000 \
   -v "$PWD/data/vector_store:/app/data/vector_store" \
+  -v "$PWD/data/rag_docs:/app/data/rag_docs:ro" \
   -v "/absolute/path/to/BitNet:/opt/bitnet" \
+  -e RAG_API_KEY \
   -e BITNET_DIR=/opt/bitnet \
   -e BITNET_MODEL=models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf \
   -e BITNET_THREADS=6 \
@@ -45,10 +54,29 @@ docker run --rm -p 127.0.0.1:8000:8000 -p 127.0.0.1:8080:8080 \
 ```
 
 Контейнер запускает BitNet server и API одним процессом через `docker/start_services.sh`.
+Папки `data` и `logs` не включаются в образ; подключайте нужные документы и хранилище индекса как тома.
 
-Сервис рассчитан на доверенный локальный доступ: авторизации нет, а индексация принимает пути к файлам и URL. Для
-внешнего доступа необходима отдельная защита сети и аутентификация. Порт BitNet в контейнере доступен только внутри
-контейнера, если сервер привязан к `127.0.0.1`.
+## Доступ к API
+
+Для `/ask`, `/ingest/files` и `/ingest/site` передавайте общий ключ в заголовке `X-API-Key`. Отсутствующий или неверный
+ключ возвращает HTTP 401. В `/docs` ключ можно указать через кнопку **Authorize**; сама документация доступна без ключа.
+В примере ниже `RAG_API_KEY` должен быть задан в окружении shell.
+
+```bash
+curl -X POST http://127.0.0.1:8000/ask \
+  -H "X-API-Key: $RAG_API_KEY" -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Пример вопроса"}]}'
+```
+
+В `test_main.http` используется переменная `{{RAG_API_KEY}}`. Для HTTP Client в PyCharm создайте рядом файл
+`http-client.private.env.json` с содержимым `{"local": {"RAG_API_KEY": "ваш ключ"}}` и выберите окружение `local`.
+Этот файл и `.env` исключены из Git и контекста сборки Docker.
+
+Общий ключ предоставляет доступ ко всем трём маршрутам, в том числе к индексации локальных путей и URL. Храните его
+на сервере интегрирующего приложения, а проверку отдельных пользователей выполняйте в этом приложении. Ограничьте права
+ОС на файлы и логи; при передаче ключа по сети используйте HTTPS. Сам BitNet не проверяет этот ключ: ограничьте доступ к
+его порту отдельно и не публикуйте его наружу. Порт BitNet в контейнере доступен только внутри контейнера, если сервер
+привязан к `127.0.0.1`.
 
 ## Основные эндпоинты
 
@@ -82,6 +110,7 @@ data/vector_store/  FAISS + BM25 индексы, rows.jsonl, embeddings.npy
 Основные переменные окружения (см. `.env.example`):
 
 - `BITNET_MODE` — режим LLM: `chat` или `completion`
+- `RAG_API_KEY` — обязательный общий ключ для запросов к API
 - `LLM_PROVIDER` — `bitnet`
 - `SYSTEM_PROMPT` — системный промпт для RAG
 - `BITNET_HOST`, `BITNET_PORT` — адрес BitNet inference server

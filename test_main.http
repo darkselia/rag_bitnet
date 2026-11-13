@@ -1,9 +1,11 @@
 ### Ингест локальных TXT/MD файлов из папки docs
 # curl -X POST "http://127.0.0.1:8000/ingest/files" \
+#   -H "X-API-Key: <RAG_API_KEY>" \
 #   -H "Content-Type: application/json" \
 #   -d '{"folder":"./rag_docs","replace_existing":true}'
 # @timeout 600
 POST http://127.0.0.1:8000/ingest/files
+X-API-Key: {{RAG_API_KEY}}
 Content-Type: application/json
 
 {
@@ -14,10 +16,12 @@ Content-Type: application/json
 
 ### Ингест сайта example.com с обходом до 100 страниц в пределах одного домена
 # curl -X POST "http://127.0.0.1:8000/ingest/site" \
+#   -H "X-API-Key: <RAG_API_KEY>" \
 #   -H "Content-Type: application/json" \
 #   -d '{"base_url":"https://example.com","max_pages":100}'
 # @timeout 600
 POST http://127.0.0.1:8000/ingest/site
+X-API-Key: {{RAG_API_KEY}}
 Content-Type: application/json
 
 {
@@ -27,9 +31,10 @@ Content-Type: application/json
 
 
 ### RAG вопрос
-# curl -N -X POST "http://127.0.0.1:8000/ask" -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"What the kolobok said to wolf?"}],"sources":["rag_docs"],"top_k":6,"temperature":0.4,"stream":true}'
+# curl -N -X POST "http://127.0.0.1:8000/ask" -H "X-API-Key: <RAG_API_KEY>" -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"What the kolobok said to wolf?"}],"sources":["rag_docs"],"top_k":6,"temperature":0.4,"stream":true}'
 # @timeout 600
 POST http://127.0.0.1:8000/ask
+X-API-Key: {{RAG_API_KEY}}
 Content-Type: application/json
 
 {
@@ -49,9 +54,10 @@ Content-Type: application/json
 
 
 ### RAG вопрос по локальным документам и сайту с site_domain
-# curl -X POST "http://127.0.0.1:8000/ask" -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"О чем твоя база данных"}],"sources":["rag_docs","site"],"site_domain":"example.com","top_k":6,"temperature":0.4,"stream":false}'
+# curl -X POST "http://127.0.0.1:8000/ask" -H "X-API-Key: <RAG_API_KEY>" -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"О чем твоя база данных"}],"sources":["rag_docs","site"],"site_domain":"example.com","top_k":6,"temperature":0.4,"stream":false}'
 # @timeout 600
 POST http://127.0.0.1:8000/ask
+X-API-Key: {{RAG_API_KEY}}
 Content-Type: application/json
 
 {

@@ -1,0 +1,10 @@
+.env
+.env.*
+http-client.private.env.json
+.git/
+.idea/
+.opencode/
+.pytest_cache/
+__pycache__/
+data/
+logs/
