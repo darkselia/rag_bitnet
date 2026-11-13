@@ -1,7 +1,7 @@
 import glob
 import re
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel
 
@@ -170,14 +170,16 @@ class CrawlConfig(BaseModel):
     user_agent: str = "rag-bot/1.0"
 
 
-def crawl_site(cfg: CrawlConfig) -> int:
+def crawl_site(cfg: CrawlConfig, failed_urls: Optional[list[str]] = None) -> int:
     all_chunks: List[Dict] = []
+    processed_ids: set[str] = set()
     _log_site(f"start base_url={cfg.base_url} max_pages={cfg.max_pages}")
     documents = site_to_documents(
         cfg.base_url,
         max_pages=cfg.max_pages,
         timeout=cfg.timeout,
         user_agent=cfg.user_agent,
+        failed_urls=failed_urls,
     )
     _log_site(f"formatted documents={len(documents)}")
     for document in documents:
@@ -186,6 +188,11 @@ def crawl_site(cfg: CrawlConfig) -> int:
             f"chunk source={document.source} stable_id={document.stable_id} "
             f"text_chars={len(document.text)} chunks={len(chunks)}"
         )
+        if not chunks:
+            if failed_urls is not None and document.source not in failed_urls:
+                failed_urls.append(document.source)
+            continue
+        processed_ids.add(document.stable_id)
         for i, ch in enumerate(chunks):
             all_chunks.append({
                 "id": f"{document.stable_id}:{i}",
@@ -198,7 +205,7 @@ def crawl_site(cfg: CrawlConfig) -> int:
         _log_site("done added=0 reason=no_chunks")
         return 0
     before = len(data_store.rows)
-    added = data_store.replace_chunks_by_documents({doc.stable_id for doc in documents}, all_chunks)
+    added = data_store.replace_chunks_by_documents(processed_ids, all_chunks)
     after = len(data_store.rows)
     _log_site(f"done candidate_chunks={len(all_chunks)} added={added} before={before} after={after}")
     if added == 0 and all_chunks:

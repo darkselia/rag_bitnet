@@ -75,8 +75,9 @@ def load_index() -> None:
     idx = faiss.read_index(str(directory / "index.faiss")) if corpus else None
     if len(corpus) != meta["count"] or (idx is not None and idx.ntotal != len(corpus)):
         raise ValueError("Index and corpus sizes do not match")
+    new_snapshot = Snapshot(loaded_rows, corpus, idx, _bm25(corpus))
     rows = loaded_rows
-    _snapshot = Snapshot(rows, corpus, idx, _bm25(corpus))
+    _snapshot = new_snapshot
 
 
 def _commit(new_rows: list[dict[str, Any]]) -> None:
@@ -97,6 +98,7 @@ def _commit(new_rows: list[dict[str, Any]]) -> None:
         idx = faiss.IndexFlatIP(embeddings.shape[1])
         idx.add(embeddings)
     bm25 = _bm25(corpus)
+    new_snapshot = Snapshot(new_rows, corpus, idx, bm25)
     version = uuid.uuid4().hex
     directory = config.DATA_DIR / "versions" / version
     directory.mkdir(parents=True)
@@ -115,7 +117,7 @@ def _commit(new_rows: list[dict[str, Any]]) -> None:
     pointer_tmp.write_text(json.dumps({"version": version}), encoding="utf-8")
     os.replace(pointer_tmp, config.DATA_DIR / "current.json")
     rows = new_rows
-    _snapshot = Snapshot(rows, corpus, idx, bm25)
+    _snapshot = new_snapshot
 
 
 def replace_chunks_by_paths(paths: set[str], chunks: list[dict[str, Any]]) -> int:

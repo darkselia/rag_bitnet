@@ -379,11 +379,19 @@ def _flatten_json_records(data: Any, path: str = "") -> list[tuple[str, str]]:
     return []
 
 
-def json_to_documents(json_url: str, json_text: str) -> list[FormattedDocument]:
+def _record_failed(failed_urls: Optional[list[str]], url: str) -> None:
+    if failed_urls is not None and url not in failed_urls:
+        failed_urls.append(url)
+
+
+def json_to_documents(
+        json_url: str, json_text: str, *, failed_urls: Optional[list[str]] = None,
+) -> list[FormattedDocument]:
     try:
         data = json.loads(json_text)
     except json.JSONDecodeError as e:
         logger.info(f"json parse failed url={json_url} error={e}")
+        _record_failed(failed_urls, json_url)
         return []
 
     documents = []
@@ -400,6 +408,8 @@ def json_to_documents(json_url: str, json_text: str) -> list[FormattedDocument]:
             stable_id=stable_id,
         ))
     logger.info(f"json formatted url={json_url} documents={len(documents)}")
+    if not documents:
+        _record_failed(failed_urls, json_url)
     return documents
 
 
@@ -409,6 +419,7 @@ def site_to_documents(
         max_pages: int,
         timeout: int,
         user_agent: str,
+        failed_urls: Optional[list[str]] = None,
 ) -> list[FormattedDocument]:
     visited_pages = set()
     visited_assets = set()
@@ -426,6 +437,7 @@ def site_to_documents(
         html = fetch_text(url, timeout=timeout, user_agent=user_agent, content_types=("text/html",))
         if not html:
             logger.info(f"page skip url={url} reason=no_html")
+            _record_failed(failed_urls, url)
             continue
 
         text = html_to_text(html)
@@ -441,6 +453,7 @@ def site_to_documents(
             logger.info(f"page document added url={url}")
         else:
             logger.info(f"page document skipped url={url} reason=text_too_short threshold=200")
+            _record_failed(failed_urls, url)
 
         page_links = discover_page_links(base_url, url, html)
         assets = discover_html_assets(base_url, url, html)
@@ -464,11 +477,12 @@ def site_to_documents(
                     content_types=("application/json", "text/json", "text/plain"),
                 )
                 if json_text:
-                    json_documents = json_to_documents(asset_url, json_text)
+                    json_documents = json_to_documents(asset_url, json_text, failed_urls=failed_urls)
                     documents.extend(json_documents)
                     logger.info(f"asset json added url={asset_url} documents={len(json_documents)}")
                 else:
                     logger.info(f"asset json skipped url={asset_url} reason=no_text")
+                    _record_failed(failed_urls, asset_url)
                 continue
 
             if re.search(r"\.js(?:\?|$)", asset_url, re.I):
@@ -480,6 +494,7 @@ def site_to_documents(
                 )
                 if not js_text:
                     logger.info(f"asset js skipped url={asset_url} reason=no_text")
+                    _record_failed(failed_urls, asset_url)
                     continue
 
                 json_urls = discover_json_urls_from_js(base_url, asset_url, js_text)
@@ -496,11 +511,12 @@ def site_to_documents(
                         content_types=("application/json", "text/json", "text/plain"),
                     )
                     if json_text:
-                        json_documents = json_to_documents(json_url, json_text)
+                        json_documents = json_to_documents(json_url, json_text, failed_urls=failed_urls)
                         documents.extend(json_documents)
                         logger.info(f"js json added url={json_url} documents={len(json_documents)}")
                     else:
                         logger.info(f"js json skipped url={json_url} reason=no_text")
+                        _record_failed(failed_urls, json_url)
             else:
                 logger.info(f"asset skipped url={asset_url} reason=unsupported_asset_type")
 

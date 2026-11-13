@@ -29,7 +29,8 @@ async def ingest_site(req: IngestSiteReq) -> dict:
 
     cfg = CrawlConfig(base_url=req.base_url, max_pages=req.max_pages)
     try:
-        added = await run_in_threadpool(crawl_site, cfg)
-        return {"added_chunks": added, "total_chunks": len(data_store.rows)}
+        failed_urls: list[str] = []
+        added = await run_in_threadpool(crawl_site, cfg, failed_urls)
+        return {"added_chunks": added, "total_chunks": len(data_store.rows), "failed_urls": failed_urls}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e

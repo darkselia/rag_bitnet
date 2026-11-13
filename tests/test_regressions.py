@@ -3,7 +3,9 @@ import csv
 import json
 import os
 import re
+import shutil
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -26,9 +28,9 @@ from benchmarks.lm_eval_adapter import BitNetLM
 from benchmarks.run_medqa import extract_answer
 from clients.bitnet_client import BitNetAPI
 from common import config
-from common.formatters import file_to_document, html_to_text
+from common.formatters import FormattedDocument, file_to_document, html_to_text
 from rag import data_store, models
-from rag.ingest import chunk_text, ingest_folder
+from rag.ingest import CrawlConfig, chunk_text, crawl_site, ingest_folder
 from rag.retrieval import QueryTooLongError, _allowed_indices, _rerank, retrieve
 from schemas.app_schema import AskReq, LLMResp, Message
 
@@ -550,6 +552,216 @@ class RegressionTests(unittest.TestCase):
                 data_store._commit([{"id": "two", "text": "second", "meta": {}}])
         self.assertIs(data_store.snapshot(), previous)
         self.assertEqual((Path(_data.name) / "current.json").read_text(encoding="utf-8"), pointer)
+
+    def test_publication_failures_preserve_index_and_restart(self):
+        original_write = Path.write_text
+        original_dumps = json.dumps
+
+        def fail_write(path, text, *args, **kwargs):
+            if path.name == "meta.json":
+                raise OSError("metadata failure")
+            return original_write(path, text, *args, **kwargs)
+
+        def fail_pointer_write(path, text, *args, **kwargs):
+            if path.name.startswith("current.") and path.suffix == ".tmp":
+                raise OSError("temporary pointer failure")
+            return original_write(path, text, *args, **kwargs)
+
+        def fail_row(value, *args, **kwargs):
+            if isinstance(value, dict) and value.get("id") == "new":
+                raise OSError("row failure")
+            return original_dumps(value, *args, **kwargs)
+
+        failures = (
+            ("snapshot", lambda: patch("rag.data_store.Snapshot", side_effect=RuntimeError("snapshot"))),
+            ("rows", lambda: patch("rag.data_store.json.dumps", side_effect=fail_row)),
+            ("vectors", lambda: patch("rag.data_store.faiss.write_index", side_effect=OSError("vectors"))),
+            ("checksums", lambda: patch("rag.data_store._digest", side_effect=OSError("checksum"))),
+            ("metadata", lambda: patch.object(Path, "write_text", new=fail_write)),
+            ("temporary pointer", lambda: patch.object(Path, "write_text", new=fail_pointer_write)),
+            ("pointer", lambda: patch("rag.data_store.os.replace", side_effect=OSError("pointer"))),
+        )
+        old = [{"id": "old", "text": "old text", "source": "old", "kind": "docs", "meta": {}}]
+        new = [{"id": "new", "text": "new text", "source": "new", "kind": "docs", "meta": {}}]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "DATA_DIR", Path(tmp)), \
+                patch.object(data_store, "rows", []), patch.object(data_store, "_snapshot",
+                                                                   data_store.Snapshot([], [], None, None)), \
+                patch("rag.data_store.get_embed_model", return_value=FakeEmbedding()):
+            data_store._commit(old)
+            pointer_path = Path(tmp) / "current.json"
+            pointer = pointer_path.read_bytes()
+            for name, failure in failures:
+                with self.subTest(step=name):
+                    before = data_store.snapshot()
+                    with failure(), self.assertRaises((RuntimeError, OSError)):
+                        data_store._commit(new)
+                    self.assertEqual(pointer_path.read_bytes(), pointer)
+                    self.assertIs(data_store.snapshot(), before)
+                    self.assertEqual(data_store.rows, old)
+                    data_store.load_index()
+                    self.assertEqual(data_store.snapshot().rows, old)
+                    self.assertEqual(data_store.snapshot().index.ntotal, 1)
+
+    def test_backup_restore_and_corrupt_index_rejection(self):
+        row = {"id": "old", "text": "backup text", "source": "file", "kind": "docs", "meta": {}}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(data_store, "rows", []), \
+                patch.object(data_store, "_snapshot", data_store.Snapshot([], [], None, None)), \
+                patch("rag.data_store.get_embed_model", return_value=FakeEmbedding()):
+            original, backup = Path(tmp) / "original", Path(tmp) / "backup"
+            with patch.object(config, "DATA_DIR", original):
+                data_store._commit([row])
+            shutil.copytree(original, backup)
+            with patch.object(config, "DATA_DIR", backup):
+                data_store.load_index()
+                self.assertEqual(data_store.snapshot().rows, [row])
+                before = data_store.snapshot()
+                version = json.loads((backup / "current.json").read_text())["version"]
+                metadata_path = backup / "versions" / version / "meta.json"
+                metadata = json.loads(metadata_path.read_text())
+                invalid_metadata = {**metadata, "count": 2}
+                metadata_path.write_text(json.dumps(invalid_metadata), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "sizes do not match"):
+                    data_store.load_index()
+                self.assertIs(data_store.snapshot(), before)
+                metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+                wrong_index = unittest.mock.MagicMock(ntotal=2)
+                with patch("rag.data_store.faiss.read_index", return_value=wrong_index):
+                    with self.assertRaisesRegex(ValueError, "sizes do not match"):
+                        data_store.load_index()
+                self.assertIs(data_store.snapshot(), before)
+                with patch("rag.data_store._bm25", side_effect=RuntimeError("BM25 failure")):
+                    with self.assertRaisesRegex(RuntimeError, "BM25"):
+                        data_store.load_index()
+                self.assertIs(data_store.snapshot(), before)
+                self.assertIs(data_store.rows, before.rows)
+                (backup / "versions" / version / "rows.jsonl").write_text("broken", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "checksum"):
+                    data_store.load_index()
+                self.assertIs(data_store.snapshot(), before)
+                self.assertEqual(data_store.rows, [row])
+
+    def test_query_while_index_is_rebuilt(self):
+        started, release = threading.Event(), threading.Event()
+        errors = []
+        old = {"id": "old", "text": "old lantern blue", "source": "lantern", "kind": "docs",
+               "meta": {"path": "/lantern"}}
+        new = {"id": "new", "text": "new lantern green", "source": "lantern", "kind": "docs",
+               "meta": {"path": "/lantern"}}
+
+        class BlockingEmbedding(FakeEmbedding):
+            def encode(self, texts, **kwargs):
+                started.set()
+                if not release.wait(30):
+                    raise TimeoutError("test did not release index build")
+                return super().encode(texts, **kwargs)
+
+        def rebuild():
+            try:
+                data_store.replace_chunks_by_paths({"/lantern"}, [new])
+            except Exception as exc:
+                errors.append(exc)
+
+        llm = unittest.mock.MagicMock()
+        llm.generate.return_value = LLMResp(content="answer")
+        payload = {"messages": [{"role": "user", "content": "lantern"}], "top_k": 1}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "DATA_DIR", Path(tmp)), \
+                patch.object(config, "RAG_API_KEY", "test-secret"), patch.object(config, "BITNET_CONTEXT_SIZE", 0), \
+                patch.object(config, "RETRIEVAL_SIM_THRESHOLD", 0), patch.object(config, "RERANKER_MIN_SCORE", None), \
+                patch.object(data_store, "rows", []), patch.object(data_store, "_snapshot",
+                                                                   data_store.Snapshot([], [], None, None)), \
+                patch("rag.models.get_embed_model", return_value=FakeEmbedding()), \
+                patch("rag.models.get_reranker", return_value=None), \
+                patch("api.ask_service.get_llm", return_value=llm), patch("api.ask_service._log_csv"):
+            with patch("rag.data_store.get_embed_model", return_value=FakeEmbedding()):
+                data_store._commit([old])
+            pointer = (Path(tmp) / "current.json").read_bytes()
+            with patch("rag.data_store.get_embed_model", return_value=BlockingEmbedding()):
+                writer = threading.Thread(target=rebuild)
+                writer.start()
+                try:
+                    self.assertTrue(started.wait(10))
+                    status, body = asyncio.run(asgi_request("POST", "/ask", payload, "test-secret"))
+                    self.assertEqual(status, 200)
+                    self.assertEqual(json.loads(body)["used_context"][0]["text"], old["text"])
+                    self.assertTrue(writer.is_alive())
+                    self.assertEqual((Path(tmp) / "current.json").read_bytes(), pointer)
+                finally:
+                    release.set()
+                    writer.join(10)
+                self.assertFalse(writer.is_alive())
+            self.assertEqual(errors, [])
+            self.assertNotEqual((Path(tmp) / "current.json").read_bytes(), pointer)
+            status, body = asyncio.run(asgi_request("POST", "/ask", payload, "test-secret"))
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["used_context"][0]["text"], new["text"])
+            data_store.load_index()
+            self.assertEqual(data_store.snapshot().rows, [new])
+
+    def test_site_partial_failure_keeps_previously_indexed_sources(self):
+        base = "https://example.com/"
+        pages = {
+            base: '<p>' + 'root text ' * 30 + '</p><a href="/ok">ok</a><a href="/failed">bad</a><script src="/bad.json"></script>',
+            base + "ok": '<p>' + 'new content ' * 30 + '</p>',
+            base + "failed": None,
+            base + "bad.json": "{",
+        }
+        old = [
+            {"id": "old-ok", "text": "old ok", "source": base + "ok", "kind": "site",
+             "meta": {"document_id": "site-html:" + base + "ok"}},
+            {"id": "old-failed", "text": "old failed", "source": base + "failed", "kind": "site",
+             "meta": {"document_id": "site-html:" + base + "failed"}},
+            {"id": "old-json", "text": "old json", "source": base + "bad.json", "kind": "site",
+             "meta": {"document_id": "site-json:" + base + "bad.json#root"}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "DATA_DIR", Path(tmp)), \
+                patch.object(config, "RAG_API_KEY", "test-secret"), \
+                patch.object(data_store, "rows", []), patch.object(data_store, "_snapshot",
+                                                                   data_store.Snapshot([], [], None, None)), \
+                patch("rag.data_store.get_embed_model", return_value=FakeEmbedding()), \
+                patch("common.formatters.same_domain", return_value=True), \
+                patch("common.formatters.fetch_text", side_effect=lambda url, **kwargs: pages.get(url)):
+            data_store._commit(old)
+            status, body = asyncio.run(asgi_request("POST", "/ingest/site", {"base_url": base}, "test-secret"))
+            self.assertEqual(status, 200)
+            self.assertCountEqual(json.loads(body)["failed_urls"], [base + "failed", base + "bad.json"])
+            texts = [row["text"] for row in data_store.snapshot().rows]
+            self.assertIn("old failed", texts)
+            self.assertIn("old json", texts)
+            self.assertNotIn("old ok", texts)
+            self.assertTrue(any("new content" in text for text in texts))
+
+    def test_site_source_without_chunks_is_not_replaced(self):
+        old = {"id": "old", "text": "old text", "source": "https://example.com/empty", "kind": "site",
+               "meta": {"document_id": "empty"}}
+        documents = [
+            FormattedDocument(text="  ", source=old["source"], kind="site", stable_id="empty"),
+            FormattedDocument(text="new text", source="https://example.com/new", kind="site", stable_id="new"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "DATA_DIR", Path(tmp)), \
+                patch.object(data_store, "rows", []), patch.object(data_store, "_snapshot",
+                                                                   data_store.Snapshot([], [], None, None)), \
+                patch("rag.data_store.get_embed_model", return_value=FakeEmbedding()), \
+                patch("rag.ingest.site_to_documents", return_value=documents):
+            data_store._commit([old])
+            failed_urls: list[str] = []
+            crawl_site(CrawlConfig(base_url="https://example.com"), failed_urls)
+            self.assertEqual(failed_urls, [old["source"]])
+            self.assertCountEqual([row["text"] for row in data_store.snapshot().rows], ["old text", "new text"])
+
+    def test_missing_local_file_is_not_deleted_from_index(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "DATA_DIR", Path(tmp) / "index"), \
+                patch.object(data_store, "rows", []), patch.object(data_store, "_snapshot",
+                                                                   data_store.Snapshot([], [], None, None)), \
+                patch("rag.data_store.get_embed_model", return_value=FakeEmbedding()):
+            folder = Path(tmp) / "docs"
+            folder.mkdir()
+            (folder / "one.txt").write_text("old one", encoding="utf-8")
+            (folder / "two.txt").write_text("old two", encoding="utf-8")
+            ingest_folder(str(folder), True)
+            (folder / "one.txt").write_text("new one", encoding="utf-8")
+            (folder / "two.txt").unlink()
+            ingest_folder(str(folder), True)
+            self.assertCountEqual([row["text"] for row in data_store.snapshot().rows], ["new one", "old two"])
 
     def test_medqa_requires_unambiguous_letter(self):
         self.assertEqual(extract_answer("(B).\n"), "B")
