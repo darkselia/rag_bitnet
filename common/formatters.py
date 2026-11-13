@@ -90,18 +90,23 @@ def html_file_to_document(path: Path) -> Optional[FormattedDocument]:
 def pdf_file_to_document(path: Path) -> Optional[FormattedDocument]:
     try:
         from pypdf import PdfReader
+        from pypdf.errors import PyPdfError
     except ImportError:
         try:
             from PyPDF2 import PdfReader
+            from PyPDF2.errors import PdfReadError as PyPdfError
         except ImportError as e:
             raise RuntimeError("PDF ingest requires pypdf or PyPDF2 to be installed") from e
 
-    reader = PdfReader(str(path))
-    pages = []
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        if text.strip():
-            pages.append(text)
+    try:
+        reader = PdfReader(str(path))
+        pages = []
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            if text.strip():
+                pages.append(text)
+    except PyPdfError as e:
+        raise ValueError(f"Invalid PDF file: {path.name}") from e
     text = normalize_ws("\n\n".join(pages))
     if not text:
         return None
@@ -244,18 +249,18 @@ def fetch_text(url: str, *, timeout: int, user_agent: str, content_types: Iterab
         content_type = r.headers.get("Content-Type", "")
         expected = tuple(content_types)
         logger.info(
-            f"fetch url={url} status={r.status_code} "
-            f"content_type={content_type!r} bytes={len(r.content)} expected={expected}"
+            f"fetch status={r.status_code} "
+            f"bytes={len(r.content)}"
         )
         if r.status_code != 200:
-            logger.info(f"skip url={url} reason=status_not_200")
+            logger.info("skip reason=status_not_200")
             return None
         if not any(t in content_type for t in expected):
-            logger.info(f"skip url={url} reason=unexpected_content_type")
+            logger.info("skip reason=unexpected_content_type")
             return None
         return r.text
     except Exception as e:
-        logger.info(f"fetch failed url={url} error={type(e).__name__}: {e}")
+        logger.info("fetch failed error_type=%s", type(e).__name__)
         return None
 
 
@@ -390,7 +395,7 @@ def json_to_documents(
     try:
         data = json.loads(json_text)
     except json.JSONDecodeError as e:
-        logger.info(f"json parse failed url={json_url} error={e}")
+        logger.info("json parse failed error_type=%s", type(e).__name__)
         _record_failed(failed_urls, json_url)
         return []
 
@@ -407,7 +412,7 @@ def json_to_documents(
             meta={"url": json_url, "record_id": record_id},
             stable_id=stable_id,
         ))
-    logger.info(f"json formatted url={json_url} documents={len(documents)}")
+    logger.info("json formatted documents=%s", len(documents))
     if not documents:
         _record_failed(failed_urls, json_url)
     return documents
@@ -425,24 +430,24 @@ def site_to_documents(
     visited_assets = set()
     queue = [base_url]
     documents: list[FormattedDocument] = []
-    logger.info(f"start base_url={base_url} max_pages={max_pages}")
+    logger.info("start max_pages=%s", max_pages)
 
     while queue and len(visited_pages) < max_pages:
         url = queue.pop(0)
         if url in visited_pages:
             continue
         visited_pages.add(url)
-        logger.info(f"page start url={url} visited_pages={len(visited_pages)} queue={len(queue)}")
+        logger.info("page start visited_pages=%s queue=%s", len(visited_pages), len(queue))
 
         html = fetch_text(url, timeout=timeout, user_agent=user_agent, content_types=("text/html",))
         if not html:
-            logger.info(f"page skip url={url} reason=no_html")
+            logger.info("page skip reason=no_html")
             _record_failed(failed_urls, url)
             continue
 
         text = html_to_text(html)
-        logger.info(f"page text url={url} html_chars={len(html)} text_chars={len(text)}")
-        if len(text) >= 200:
+        logger.info("page text html_chars=%s text_chars=%s", len(html), len(text))
+        if len(text) >= config.SITE_MIN_TEXT_CHARS:
             documents.append(FormattedDocument(
                 text=text,
                 source=url,
@@ -450,14 +455,14 @@ def site_to_documents(
                 meta={"url": url},
                 stable_id=f"site-html:{url}",
             ))
-            logger.info(f"page document added url={url}")
+            logger.info("page document added")
         else:
-            logger.info(f"page document skipped url={url} reason=text_too_short threshold=200")
+            logger.info("page document skipped reason=text_too_short threshold=%s", config.SITE_MIN_TEXT_CHARS)
             _record_failed(failed_urls, url)
 
         page_links = discover_page_links(base_url, url, html)
         assets = discover_html_assets(base_url, url, html)
-        logger.info(f"page discovered url={url} links={len(page_links)} assets={len(assets)}")
+        logger.info("page discovered links=%s assets=%s", len(page_links), len(assets))
 
         for link in page_links:
             if link not in visited_pages and link not in queue:
@@ -467,7 +472,7 @@ def site_to_documents(
             if asset_url in visited_assets:
                 continue
             visited_assets.add(asset_url)
-            logger.info(f"asset start url={asset_url}")
+            logger.info("asset start")
 
             if re.search(r"\.json(?:\?|$)", asset_url, re.I):
                 json_text = fetch_text(
@@ -479,9 +484,9 @@ def site_to_documents(
                 if json_text:
                     json_documents = json_to_documents(asset_url, json_text, failed_urls=failed_urls)
                     documents.extend(json_documents)
-                    logger.info(f"asset json added url={asset_url} documents={len(json_documents)}")
+                    logger.info("asset json added documents=%s", len(json_documents))
                 else:
-                    logger.info(f"asset json skipped url={asset_url} reason=no_text")
+                    logger.info("asset json skipped reason=no_text")
                     _record_failed(failed_urls, asset_url)
                 continue
 
@@ -493,17 +498,17 @@ def site_to_documents(
                     content_types=("javascript", "ecmascript", "text/plain"),
                 )
                 if not js_text:
-                    logger.info(f"asset js skipped url={asset_url} reason=no_text")
+                    logger.info("asset js skipped reason=no_text")
                     _record_failed(failed_urls, asset_url)
                     continue
 
                 json_urls = discover_json_urls_from_js(base_url, asset_url, js_text)
-                logger.info(f"asset js scanned url={asset_url} js_chars={len(js_text)} json_urls={len(json_urls)}")
+                logger.info("asset js scanned js_chars=%s json_urls=%s", len(js_text), len(json_urls))
                 for json_url in json_urls:
                     if json_url in visited_assets:
                         continue
                     visited_assets.add(json_url)
-                    logger.info(f"js json start url={json_url} from={asset_url}")
+                    logger.info("js json start")
                     json_text = fetch_text(
                         json_url,
                         timeout=timeout,
@@ -513,15 +518,15 @@ def site_to_documents(
                     if json_text:
                         json_documents = json_to_documents(json_url, json_text, failed_urls=failed_urls)
                         documents.extend(json_documents)
-                        logger.info(f"js json added url={json_url} documents={len(json_documents)}")
+                        logger.info("js json added documents=%s", len(json_documents))
                     else:
-                        logger.info(f"js json skipped url={json_url} reason=no_text")
+                        logger.info("js json skipped reason=no_text")
                         _record_failed(failed_urls, json_url)
             else:
-                logger.info(f"asset skipped url={asset_url} reason=unsupported_asset_type")
+                logger.info("asset skipped reason=unsupported_asset_type")
 
     logger.info(
-        f"done base_url={base_url} pages={len(visited_pages)} "
+        f"done pages={len(visited_pages)} "
         f"assets={len(visited_assets)} documents={len(documents)}"
     )
     return documents

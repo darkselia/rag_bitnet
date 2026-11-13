@@ -12,6 +12,7 @@ import numpy as np
 from rank_bm25 import BM25Okapi
 
 from common import config
+from common.logger import operation_update
 from common.text_utils import tokenize
 from rag.models import get_embed_model
 
@@ -22,6 +23,7 @@ class Snapshot:
     corpus: list[str]
     index: Any
     bm25: Any
+    version: str | None = None
 
 
 _lock = threading.RLock()
@@ -75,7 +77,7 @@ def load_index() -> None:
     idx = faiss.read_index(str(directory / "index.faiss")) if corpus else None
     if len(corpus) != meta["count"] or (idx is not None and idx.ntotal != len(corpus)):
         raise ValueError("Index and corpus sizes do not match")
-    new_snapshot = Snapshot(loaded_rows, corpus, idx, _bm25(corpus))
+    new_snapshot = Snapshot(loaded_rows, corpus, idx, _bm25(corpus), version)
     rows = loaded_rows
     _snapshot = new_snapshot
 
@@ -98,8 +100,8 @@ def _commit(new_rows: list[dict[str, Any]]) -> None:
         idx = faiss.IndexFlatIP(embeddings.shape[1])
         idx.add(embeddings)
     bm25 = _bm25(corpus)
-    new_snapshot = Snapshot(new_rows, corpus, idx, bm25)
     version = uuid.uuid4().hex
+    new_snapshot = Snapshot(new_rows, corpus, idx, bm25, version)
     directory = config.DATA_DIR / "versions" / version
     directory.mkdir(parents=True)
     with (directory / "rows.jsonl").open("w", encoding="utf-8") as f:
@@ -118,6 +120,7 @@ def _commit(new_rows: list[dict[str, Any]]) -> None:
     os.replace(pointer_tmp, config.DATA_DIR / "current.json")
     rows = new_rows
     _snapshot = new_snapshot
+    operation_update(index_version=version, total_chunks=len(new_rows))
 
 
 def replace_chunks_by_paths(paths: set[str], chunks: list[dict[str, Any]]) -> int:
@@ -144,6 +147,8 @@ def add_chunks(chunks: list[dict[str, Any]]) -> int:
         new_items = [c for c in chunks if c["id"] not in existing]
         if new_items:
             _commit(rows + new_items)
+        else:
+            operation_update(index_version=_snapshot.version, total_chunks=len(_snapshot.rows))
         return len(new_items)
 
 

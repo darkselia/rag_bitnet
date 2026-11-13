@@ -15,7 +15,7 @@ User Request
    LLM.generate(messages, context) ◄──── _build_user_message()
       │
       ▼
-   CsvLogger (логирование в .csv с таймингами)
+   журнал операций + CsvLogger (метрики без содержимого по умолчанию)
      │
      ▼
   BitNetAPI ──► HTTP POST ──► BitNet inference server
@@ -107,17 +107,13 @@ class Timings(BaseModel):
   predicted_per_second: float
 ```
 
-## CsvLogger
+## Журнал операций
 
-Каждый RAG-запрос логируется в `logs/ask_service.csv` через потокобезопасный `CsvLogger`.
-Поддерживает обновление строки по ключу (используется `timestamp`): сначала пишется строка с retrieve-полями,
-затем при ответе LLM она дополняется LLM-полями.
+ASGI middleware создаёт `operation_id` для каждого прикладного POST-запроса и записывает начало и итог в
+`logs/operations.jsonl`. `ContextVar` передаёт общие сведения сервисам и рабочим потокам; финальная запись появляется
+после завершения ответа, включая streaming. Сервис индексации фиксирует версию и размер непосредственно при публикации,
+пока удерживается блокировка записи. Поиск и генерация добавляют длительности, ошибки — безопасную категорию и тип.
 
-## CsvLogger
-
-```python
-class CsvLogger:
-  def __init__(self, name: str, fieldnames: list[str] | None = None, key: str | None = None)
-
-    def log(self, row: dict) -> None
-```
+`CsvLogger` сохраняет метрики `/ask` в `logs/ask_service.csv` и связывает обновления строки по `operation_id`.
+Вопросы, контекст и ответы добавляются только при `LOG_REQUEST_CONTENT=true`. Оба журнала и технические файлы имеют
+ротацию по размеру; подробности, ограничения и правила доступа приведены в README.

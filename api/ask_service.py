@@ -12,23 +12,25 @@ from starlette.responses import StreamingResponse
 
 from clients.llm import get_llm
 from common import config
-from common.logger import CsvLogger, get_logger
+from common.logger import CsvLogger, current_operation, get_logger, operation_update
 from schemas.app_schema import AskReq, AskResp, LLMResp, Message
 
 logger = get_logger("ask_service")
 NO_CONTEXT_ANSWER = "Couldn't find the answer in the database."
 
 CSV_FIELDS = [
-    "timestamp", "retrieve time", "user question", "contest",
+    "operation_id", "timestamp", "retrieve time", "user question", "contest",
     "llm time", "llm answer", "id",
     "prompt_n", "prompt_ms", "prompt_per_token_ms", "prompt_per_second",
     "predicted_n", "predicted_ms", "predicted_per_token_ms", "predicted_per_second",
     "model",
 ]
-csv_logger = CsvLogger("ask_service", fieldnames=CSV_FIELDS, key="timestamp")
+csv_logger = CsvLogger("ask_service", fieldnames=CSV_FIELDS, key="operation_id")
 
 
 def _log_csv(row: dict) -> None:
+    operation = current_operation.get()
+    row = {"operation_id": operation["operation_id"] if operation else row["timestamp"], **row}
     if not config.LOG_REQUEST_CONTENT:
         row = {k: v for k, v in row.items() if k not in {"user question", "contest", "llm answer"}}
     csv_logger.log(row)
@@ -92,11 +94,13 @@ def _stream_answer(
         if not finished:
             raise ValueError("LLM stream ended without a final event")
     except Exception as e:
-        logger.warning("LLM stream failed: %s", e)
+        logger.warning("LLM stream failed error_type=%s", type(e).__name__)
+        operation_update(status="error", error_category="llm_stream_error", error_type=type(e).__name__)
         yield json.dumps({"error": "LLM stream failed"}) + "\n"
         return
 
     llm_elapsed = time.monotonic() - llm_start
+    operation_update(generation_ms=round(llm_elapsed * 1000, 2))
     answer = "".join(chunks)
     logger.info(
         "llm: mode=%s model=%s prompt_n=%s predicted_n=%s elapsed=%.3fs",
@@ -136,14 +140,15 @@ def _stream_answer(
 async def ask(req: AskReq) -> AskResp | StreamingResponse:
     from rag.retrieval import MIN_SEARCH_CANDIDATES, QueryTooLongError, retrieve_async
 
+    operation_update(response_mode="stream" if req.stream else "json")
     query = _extract_query(req.messages)
     timestamp = datetime.now(timezone.utc).isoformat()
     logger.info(
-        "request sources=%s top_k=%s temperature=%s stream=%s",
-        req.sources, req.top_k, req.temperature, req.stream,
+        "request top_k=%s temperature=%s stream=%s",
+        req.top_k, req.temperature, req.stream,
     )
 
-    retrieve_start = time.time()
+    retrieve_start = time.monotonic()
     candidate_count = max(MIN_SEARCH_CANDIDATES, req.top_k)
     try:
         contexts = await retrieve_async(
@@ -151,8 +156,11 @@ async def ask(req: AskReq) -> AskResp | StreamingResponse:
             config.RETRIEVAL_SIM_THRESHOLD, req.sources, req.site_domain,
         )
     except QueryTooLongError as e:
-        raise HTTPException(status_code=413, detail=str(e)) from e
-    retrieve_elapsed = time.time() - retrieve_start
+        operation_update(error_category="invalid_input", error_type=type(e).__name__)
+        raise HTTPException(status_code=413, detail="Question exceeds the reranker token limit") from e
+    finally:
+        retrieve_elapsed = time.monotonic() - retrieve_start
+        operation_update(retrieval_ms=round(retrieve_elapsed * 1000, 2))
     logger.info("retrieve: contexts=%d elapsed=%.3fs", len(contexts), retrieve_elapsed)
 
     if not contexts:
@@ -169,8 +177,10 @@ async def ask(req: AskReq) -> AskResp | StreamingResponse:
             try:
                 count = await run_in_threadpool(llm.count_prompt_tokens, messages, ctx_text)
             except requests.Timeout as e:
+                operation_update(error_category="llm_timeout", error_type=type(e).__name__)
                 raise HTTPException(status_code=504, detail="LLM tokenizer timed out") from e
             except (requests.RequestException, ValueError, KeyError) as e:
+                operation_update(error_category="llm_error", error_type=type(e).__name__)
                 raise HTTPException(status_code=502, detail="Exact prompt tokenization unavailable") from e
             if count + config.LLM_MAX_TOKENS <= config.BITNET_CONTEXT_SIZE:
                 if not contexts:
@@ -190,14 +200,18 @@ async def ask(req: AskReq) -> AskResp | StreamingResponse:
     if req.stream:
         logger.info("stream: started")
         llm_start = time.monotonic()
+        operation_update(_generation_started=llm_start)
         pieces = llm.generate_stream(messages, config.LLM_MAX_TOKENS, req.temperature, context=ctx_text)
         try:
             first = await run_in_threadpool(next, pieces, None)
         except requests.Timeout as e:
+            operation_update(error_category="llm_timeout", error_type=type(e).__name__)
             raise HTTPException(status_code=504, detail="LLM request timed out") from e
         except (requests.RequestException, ValueError) as e:
+            operation_update(error_category="llm_error", error_type=type(e).__name__)
             raise HTTPException(status_code=502, detail="LLM request failed") from e
         if first is None:
+            operation_update(error_category="llm_stream_error")
             raise HTTPException(status_code=502, detail="LLM stream ended unexpectedly")
         return StreamingResponse(
             _stream_answer(
@@ -207,16 +221,20 @@ async def ask(req: AskReq) -> AskResp | StreamingResponse:
             media_type="application/x-ndjson; charset=utf-8",
         )
 
-    llm_start = time.time()
+    llm_start = time.monotonic()
+    operation_update(_generation_started=llm_start)
     try:
         resp = await run_in_threadpool(
             llm.generate, messages, config.LLM_MAX_TOKENS, req.temperature, context=ctx_text,
         )
     except requests.Timeout as e:
+        operation_update(error_category="llm_timeout", error_type=type(e).__name__)
         raise HTTPException(status_code=504, detail="LLM request timed out") from e
     except (requests.RequestException, ValueError) as e:
+        operation_update(error_category="llm_error", error_type=type(e).__name__)
         raise HTTPException(status_code=502, detail="LLM request failed") from e
-    llm_elapsed = time.time() - llm_start
+    llm_elapsed = time.monotonic() - llm_start
+    operation_update(generation_ms=round(llm_elapsed * 1000, 2))
     logger.info(
         "llm: mode=%s model=%s prompt_n=%s predicted_n=%s elapsed=%.3fs",
         config.BITNET_MODE, resp.model,

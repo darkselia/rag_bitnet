@@ -79,6 +79,7 @@ rag_bitnet/
   берутся из ответа сервера.
 - **Streaming** — ndjson (`application/x-ndjson`): каждый чанк — отдельная JSON-строка с `{"id","content","model"}`,
   финальная строка — `AskResp` с `id`, `answer`, `timings`, `used_context` или строка с ошибкой.
+- **Operation logging** — события API связаны по `X-Request-ID` и сохраняются в `logs/operations.jsonl`.
 - **CSV logging** — содержимое запроса и ответа записывается только при `LOG_REQUEST_CONTENT=true`.
 - **Data storage** — версии корпуса, FAISS и метаданных хранятся в `DATA_DIR/versions`; `current.json` указывает на
   опубликованную версию.

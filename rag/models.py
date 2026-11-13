@@ -33,7 +33,7 @@ def get_reranker() -> Optional[CrossEncoder]:
                 torch.ao.quantization.quantize_dynamic(model.model, {torch.nn.Linear}, dtype=torch.qint8, inplace=True)
                 logger.info("[init] CPU reranker quantization enabled")
             except (RuntimeError, NotImplementedError) as e:
-                logger.warning("[init] reranker quantization failed; loading original model: %s", e)
+                logger.warning("[init] reranker quantization failed; loading original model: %s", type(e).__name__)
                 model = None
         if model is None:
             model = CrossEncoder(config.RERANKER_MODEL, device=_device)

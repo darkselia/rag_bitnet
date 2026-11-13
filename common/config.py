@@ -80,6 +80,18 @@ def _env_path(name: str, default: str) -> Path:
 
 DATA_DIR = _env_path("DATA_DIR", "./data/vector_store")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR = _env_path("LOG_DIR", "./logs")
+LOG_MAX_BYTES = _env_int("LOG_MAX_BYTES", 5 * 1024 * 1024, min_value=1)
+LOG_BACKUP_COUNT = _env_int("LOG_BACKUP_COUNT", 3, min_value=1)
+LOG_LEVEL = _env_str("LOG_LEVEL", "DEBUG").upper()
+if LOG_LEVEL not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+    raise ValueError("LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR or CRITICAL")
+INGEST_CHUNK_CHARS = _env_int("INGEST_CHUNK_CHARS", 1800, min_value=1)
+INGEST_CHUNK_OVERLAP = _env_int("INGEST_CHUNK_OVERLAP", 200, min_value=0)
+if INGEST_CHUNK_OVERLAP >= INGEST_CHUNK_CHARS:
+    raise ValueError("INGEST_CHUNK_OVERLAP must be less than INGEST_CHUNK_CHARS")
+SITE_TIMEOUT = _env_int("SITE_TIMEOUT", 10, min_value=1)
+SITE_MIN_TEXT_CHARS = _env_int("SITE_MIN_TEXT_CHARS", 200, min_value=1)
 INGEST_MAX_FILE_BYTES = _env_int("INGEST_MAX_FILE_BYTES", 25 * 1024 * 1024, min_value=1)
 INGEST_MAX_BATCH_BYTES = _env_int("INGEST_MAX_BATCH_BYTES", 100 * 1024 * 1024, min_value=1)
 INGEST_MAX_DOCX_UNCOMPRESSED_BYTES = _env_int(

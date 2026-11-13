@@ -1,9 +1,11 @@
+@RAG_API_KEY=test
+
 ### Ингест локальных PDF/DOCX/TXT/CSV/MD/HTML файлов
 # curl -X POST "http://127.0.0.1:8000/ingest/files" \
 #   -H "X-API-Key: <RAG_API_KEY>" \
 #   -H "Content-Type: application/json" \
 #   -d '{"folder":"./rag_docs","replace_existing":true}'
-# @timeout 600
+# @timeout 60000
 POST http://127.0.0.1:8000/ingest/files
 X-API-Key: {{RAG_API_KEY}}
 Content-Type: application/json
@@ -19,7 +21,7 @@ Content-Type: application/json
 #   -H "X-API-Key: <RAG_API_KEY>" \
 #   -H "Content-Type: application/json" \
 #   -d '{"base_url":"https://example.com","max_pages":100}'
-# @timeout 600
+# @timeout 60000
 POST http://127.0.0.1:8000/ingest/site
 X-API-Key: {{RAG_API_KEY}}
 Content-Type: application/json
@@ -32,7 +34,7 @@ Content-Type: application/json
 
 ### RAG вопрос
 # curl -N -X POST "http://127.0.0.1:8000/ask" -H "X-API-Key: <RAG_API_KEY>" -H "Content-Type: application/json" -d '{"messages":[{"role":"user","content":"What the kolobok said to wolf?"}],"sources":["rag_docs"],"top_k":6,"temperature":0.4,"stream":true}'
-# @timeout 600
+# @timeout 60000
 POST http://127.0.0.1:8000/ask
 X-API-Key: {{RAG_API_KEY}}
 Content-Type: application/json

@@ -13,6 +13,10 @@ from rag import data_store
 logger = get_logger("ingest")
 
 
+class IngestInputError(ValueError):
+    pass
+
+
 def _log_site(message: str) -> None:
     logger.info(message)
 
@@ -117,14 +121,16 @@ def _chunk_section(text: str, max_chars: int, overlap: int) -> List[str]:
     return chunks
 
 
-def chunk_text(text: str, max_chars: int = 1800, overlap: int = 200) -> List[str]:
+def chunk_text(text: str, max_chars: int = config.INGEST_CHUNK_CHARS,
+               overlap: int = config.INGEST_CHUNK_OVERLAP) -> List[str]:
     return [chunk for section in _sections(text) for chunk in _chunk_section(section, max_chars, overlap)]
 
 
 def ingest_folder(folder: str, replace_existing: bool = False) -> int:
+    logger.info("files start replace_existing=%s", replace_existing)
     folder_path = Path(folder)
     if not folder_path.exists():
-        raise FileNotFoundError(f"Folder not found: {folder}")
+        raise IngestInputError(f"Folder not found: {folder}")
     supported_suffixes = (".txt", ".md", ".html", ".htm", ".pdf", ".docx", ".csv")
     files = sorted(
         Path(p)
@@ -133,22 +139,30 @@ def ingest_folder(folder: str, replace_existing: bool = False) -> int:
     )
     total_size = 0
     for fp in files:
-        size = fp.stat().st_size
+        try:
+            size = fp.stat().st_size
+        except OSError as e:
+            raise IngestInputError("Cannot read input file") from e
         if size > config.INGEST_MAX_FILE_BYTES:
-            raise ValueError(f"File size exceeds limit: {fp.name}")
+            raise IngestInputError(f"File size exceeds limit: {fp.name}")
         total_size += size
     if total_size > config.INGEST_MAX_BATCH_BYTES:
-        raise ValueError("Total file size exceeds ingestion limit")
+        raise IngestInputError("Total file size exceeds ingestion limit")
+    logger.info("files discovered count=%s bytes=%s", len(files), total_size)
 
     new_chunks: List[Dict] = []
     processed_paths: set[str] = set()
     for fp in files:
-        document = file_to_document(fp)
+        try:
+            document = file_to_document(fp)
+        except (ValueError, OSError) as e:
+            raise IngestInputError("Cannot read or parse input file") from e
         if not document:
-            raise ValueError(f"No extractable text in file: {fp.name}")
+            raise IngestInputError(f"No extractable text in file: {fp.name}")
         chunks = chunk_text(document.text)
         if not chunks:
-            raise ValueError(f"No extractable text in file: {fp.name}")
+            raise IngestInputError(f"No extractable text in file: {fp.name}")
+        logger.info("file processed format=%s chunks=%s", fp.suffix.lower(), len(chunks))
         processed_paths.add(_stored_path(fp))
         for i, ch in enumerate(chunks):
             new_chunks.append({
@@ -159,21 +173,24 @@ def ingest_folder(folder: str, replace_existing: bool = False) -> int:
                 "meta": {**document.meta, "path": _stored_path(fp)}
             })
     if replace_existing and processed_paths:
-        return data_store.replace_chunks_by_paths(processed_paths, new_chunks)
-    return data_store.add_chunks(new_chunks)
+        added = data_store.replace_chunks_by_paths(processed_paths, new_chunks)
+    else:
+        added = data_store.add_chunks(new_chunks)
+    logger.info("files done processed=%s added_chunks=%s total_chunks=%s", len(files), added, len(data_store.rows))
+    return added
 
 
 class CrawlConfig(BaseModel):
     base_url: str
     max_pages: int = 100
-    timeout: int = 10
+    timeout: int = config.SITE_TIMEOUT
     user_agent: str = "rag-bot/1.0"
 
 
 def crawl_site(cfg: CrawlConfig, failed_urls: Optional[list[str]] = None) -> int:
     all_chunks: List[Dict] = []
     processed_ids: set[str] = set()
-    _log_site(f"start base_url={cfg.base_url} max_pages={cfg.max_pages}")
+    _log_site(f"start max_pages={cfg.max_pages}")
     documents = site_to_documents(
         cfg.base_url,
         max_pages=cfg.max_pages,
@@ -185,8 +202,7 @@ def crawl_site(cfg: CrawlConfig, failed_urls: Optional[list[str]] = None) -> int
     for document in documents:
         chunks = chunk_text(document.text)
         _log_site(
-            f"chunk source={document.source} stable_id={document.stable_id} "
-            f"text_chars={len(document.text)} chunks={len(chunks)}"
+            f"chunk text_chars={len(document.text)} chunks={len(chunks)}"
         )
         if not chunks:
             if failed_urls is not None and document.source not in failed_urls:

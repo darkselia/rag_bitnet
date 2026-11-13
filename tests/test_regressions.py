@@ -1,12 +1,17 @@
 import asyncio
 import csv
 import json
+import logging
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -23,11 +28,12 @@ os.environ["DATA_DIR"] = _data.name
 os.environ["LOG_REQUEST_CONTENT"] = "false"
 
 from api.ask_service import NO_CONTEXT_ANSWER, _stream_answer, ask
-from api.server import app, startup_event
+from api.server import OperationMiddleware, app, startup_event
 from benchmarks.lm_eval_adapter import BitNetLM
 from benchmarks.run_medqa import extract_answer
 from clients.bitnet_client import BitNetAPI
 from common import config
+from common import logger as logging_utils
 from common.formatters import FormattedDocument, file_to_document, html_to_text
 from rag import data_store, models
 from rag.ingest import CrawlConfig, chunk_text, crawl_site, ingest_folder
@@ -86,6 +92,7 @@ def write_test_pdf(path: Path, text: str | None) -> None:
 
 async def asgi_request(
         method: str, path: str, payload: dict | None = None, api_key: str | None = None,
+        response_headers: list[tuple[bytes, bytes]] | None = None,
 ) -> tuple[int, bytes]:
     headers = [(b"content-type", b"application/json")]
     if api_key is not None:
@@ -112,12 +119,246 @@ async def asgi_request(
         events.append(event)
 
     await app(scope, receive, send)
-    status = next(event["status"] for event in events if event["type"] == "http.response.start")
+    response = next(event for event in events if event["type"] == "http.response.start")
+    status = response["status"]
+    if response_headers is not None:
+        response_headers.extend(response.get("headers", []))
     content = b"".join(event.get("body", b"") for event in events if event["type"] == "http.response.body")
     return status, content
 
 
 class RegressionTests(unittest.TestCase):
+    def test_operation_log_connects_ask_events_without_content(self):
+        events, csv_rows, headers = [], [], []
+        secret = "private-question-and-key"
+        llm = unittest.mock.MagicMock()
+        llm.generate.return_value = LLMResp(id="model-id", content="private-answer")
+        contexts = [{"id": "doc", "text": "private-context", "source": "file", "kind": "docs"}]
+        payload = {"messages": [{"role": "user", "content": secret}], "top_k": 1}
+        with patch.object(config, "RAG_API_KEY", secret), patch.object(config, "BITNET_CONTEXT_SIZE", 0), \
+                patch.object(config, "LOG_REQUEST_CONTENT", False), \
+                patch("api.server.log_operation", side_effect=lambda event: events.append(event.copy())), \
+                patch("api.ask_service.csv_logger.log", side_effect=lambda row: csv_rows.append(row.copy())), \
+                patch("api.ask_service.get_llm", return_value=llm), \
+                patch("rag.retrieval.retrieve_async", new_callable=AsyncMock, return_value=contexts):
+            status, _ = asyncio.run(asgi_request("POST", "/ask", payload, secret, headers))
+        self.assertEqual(status, 200)
+        self.assertEqual([event["event"] for event in events], ["started", "completed"])
+        operation_id = events[0]["operation_id"]
+        self.assertEqual(events[1]["operation_id"], operation_id)
+        self.assertEqual(dict(headers)[b"x-request-id"].decode(), operation_id)
+        self.assertEqual(events[1]["status"], "success")
+        self.assertEqual(events[1]["response_mode"], "json")
+        self.assertGreaterEqual(events[1]["retrieval_ms"], 0)
+        self.assertGreaterEqual(events[1]["generation_ms"], 0)
+        self.assertIsNotNone(datetime.fromisoformat(events[1]["timestamp"]).utcoffset())
+        self.assertTrue(all(row["operation_id"] == operation_id for row in csv_rows))
+        logged = json.dumps([events, csv_rows])
+        for value in (secret, "private-answer", "private-context"):
+            self.assertNotIn(value, logged)
+
+    def test_operation_log_records_failures_and_stream_error(self):
+        events = []
+        payload = {"messages": [{"role": "user", "content": "private question"}], "stream": True}
+        contexts = [{"id": "doc", "text": "private context", "source": "file", "kind": "docs"}]
+
+        def broken_stream():
+            yield LLMResp(content="partial answer")
+            raise requests.ConnectionError("sensitive backend error")
+
+        llm = unittest.mock.MagicMock()
+        llm.generate_stream.return_value = broken_stream()
+        with patch.object(config, "RAG_API_KEY", "test-secret"), patch.object(config, "BITNET_CONTEXT_SIZE", 0), \
+                patch("api.server.log_operation", side_effect=lambda event: events.append(event.copy())), \
+                patch("api.ask_service._log_csv"), patch("api.ask_service.get_llm", return_value=llm), \
+                patch("rag.retrieval.retrieve_async", new_callable=AsyncMock, return_value=contexts):
+            status, body = asyncio.run(asgi_request("POST", "/ask", payload, "test-secret"))
+            self.assertEqual(status, 200)
+            self.assertIn("error", json.loads(body.splitlines()[-1]))
+            completed = events[-1]
+            self.assertEqual((completed["status"], completed["error_category"]), ("error", "llm_stream_error"))
+            self.assertEqual(completed["http_status"], 200)
+            self.assertEqual(completed["response_mode"], "stream")
+            self.assertGreaterEqual(completed["generation_ms"], 0)
+            status, _ = asyncio.run(asgi_request("POST", "/ask", payload, "wrong-secret"))
+            self.assertEqual(status, 401)
+            self.assertEqual(events[-1]["error_category"], "authentication")
+            status, _ = asyncio.run(asgi_request("POST", "/ask", {"messages": []}, "test-secret"))
+            self.assertEqual(status, 422)
+            self.assertEqual(events[-1]["error_category"], "invalid_request")
+        self.assertNotEqual(events[0]["operation_id"], events[-1]["operation_id"])
+        for value in ("private question", "private context", "partial answer", "sensitive backend error",
+                      "wrong-secret"):
+            self.assertNotIn(value, json.dumps(events))
+
+    def test_csv_content_requires_explicit_setting(self):
+        from api.ask_service import _log_csv
+
+        row = {"timestamp": "time", "user question": "question", "contest": "context", "llm answer": "answer"}
+        with patch("api.ask_service.csv_logger.log") as log:
+            with patch.object(config, "LOG_REQUEST_CONTENT", False):
+                _log_csv(row)
+            self.assertEqual(log.call_args.args[0], {"operation_id": "time", "timestamp": "time"})
+            with patch.object(config, "LOG_REQUEST_CONTENT", True):
+                _log_csv(row)
+            self.assertEqual(log.call_args.args[0]["user question"], "question")
+            self.assertEqual(log.call_args.args[0]["contest"], "context")
+            self.assertEqual(log.call_args.args[0]["llm answer"], "answer")
+
+    def test_parallel_http_requests_have_distinct_operation_ids(self):
+        events = []
+        payload = {"messages": [{"role": "user", "content": "question"}]}
+
+        async def requests_together():
+            return await asyncio.gather(*(asgi_request("POST", "/ask", payload, "test-secret") for _ in range(20)))
+
+        with patch.object(config, "RAG_API_KEY", "test-secret"), \
+                patch("api.server.log_operation", side_effect=lambda event: events.append(event.copy())), \
+                patch("api.ask_service._log_csv"), \
+                patch("rag.retrieval.retrieve_async", new_callable=AsyncMock, return_value=[]):
+            responses = asyncio.run(requests_together())
+        self.assertTrue(all(status == 200 for status, _ in responses))
+        operation_ids = {event["operation_id"] for event in events}
+        self.assertEqual(len(operation_ids), 20)
+        for operation_id in operation_ids:
+            related = [event for event in events if event["operation_id"] == operation_id]
+            self.assertEqual([event["event"] for event in related], ["started", "completed"])
+            self.assertEqual(related[-1]["status"], "success")
+
+    def test_operation_log_records_successful_stream_and_initial_timeout(self):
+        events = []
+        payload = {"messages": [{"role": "user", "content": "question"}], "stream": True}
+        contexts = [{"id": "doc", "text": "context", "source": "file", "kind": "docs"}]
+        llm = unittest.mock.MagicMock()
+        llm.generate_stream.return_value = iter([LLMResp(content="answer"), LLMResp(content="", final=True)])
+        with patch.object(config, "RAG_API_KEY", "test-secret"), patch.object(config, "BITNET_CONTEXT_SIZE", 0), \
+                patch("api.server.log_operation", side_effect=lambda event: events.append(event.copy())), \
+                patch("api.ask_service._log_csv"), patch("api.ask_service.get_llm", return_value=llm), \
+                patch("rag.retrieval.retrieve_async", new_callable=AsyncMock, return_value=contexts):
+            status, body = asyncio.run(asgi_request("POST", "/ask", payload, "test-secret"))
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body.splitlines()[-1])["answer"]["content"], "answer")
+            self.assertEqual((events[-1]["status"], events[-1]["response_mode"]), ("success", "stream"))
+
+            def timeout_stream():
+                raise requests.Timeout("private timeout")
+                yield
+
+            llm.generate_stream.return_value = timeout_stream()
+            status, body = asyncio.run(asgi_request("POST", "/ask", payload, "test-secret"))
+            self.assertEqual(status, 504)
+            self.assertEqual((events[-1]["status"], events[-1]["error_category"]), ("error", "llm_timeout"))
+            self.assertGreaterEqual(events[-1]["generation_ms"], 0)
+            self.assertNotIn(b"private timeout", body)
+
+    def test_operation_log_records_interrupted_response(self):
+        events = []
+
+        async def interrupted_app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"part", "more_body": True})
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            pass
+
+        middleware = OperationMiddleware(interrupted_app)
+        with patch("api.server.log_operation", side_effect=lambda event: events.append(event.copy())):
+            asyncio.run(middleware({"type": "http", "method": "POST", "path": "/ask"}, receive, send))
+        self.assertEqual((events[-1]["status"], events[-1]["error_category"]), ("error", "interrupted"))
+
+    def test_ingest_operation_records_version_and_sanitizes_errors(self):
+        events = []
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "DATA_DIR", Path(tmp) / "index"), \
+                patch.object(config, "RAG_API_KEY", "test-secret"), \
+                patch.object(data_store, "rows", []), patch.object(data_store, "_snapshot",
+                                                                   data_store.Snapshot([], [], None, None)), \
+                patch("rag.data_store.get_embed_model", return_value=FakeEmbedding()), \
+                patch("api.server.log_operation", side_effect=lambda event: events.append(event.copy())):
+            folder = Path(tmp) / "private-folder"
+            folder.mkdir()
+            (folder / "private-file.txt").write_text("private document contents", encoding="utf-8")
+            payload = {"folder": str(folder), "replace_existing": True}
+            status, _ = asyncio.run(asgi_request("POST", "/ingest/files", payload, "test-secret"))
+            self.assertEqual(status, 200)
+            self.assertEqual(events[-1]["index_version"], data_store.snapshot().version)
+            self.assertEqual((events[-1]["added_chunks"], events[-1]["total_chunks"]), (1, 1))
+            (folder / "private-file.txt").write_text("", encoding="utf-8")
+            status, body = asyncio.run(asgi_request("POST", "/ingest/files", payload, "test-secret"))
+            self.assertEqual(status, 400)
+            self.assertEqual(events[-1]["error_category"], "invalid_input")
+            self.assertNotIn(b"private", body)
+            (folder / "private-file.txt").unlink()
+            (folder / "private-file.pdf").write_bytes(b"secret-document-header that is not a PDF")
+            status, body = asyncio.run(asgi_request("POST", "/ingest/files", payload, "test-secret"))
+            self.assertEqual(status, 400)
+            self.assertEqual(events[-1]["error_category"], "invalid_input")
+            self.assertNotIn(b"secret-document-header", body)
+            self.assertGreater(logging.getLogger("pypdf._reader").getEffectiveLevel(), logging.WARNING)
+            with patch("api.ingest_service.ingest_folder", side_effect=OSError("sensitive internal path")):
+                status, body = asyncio.run(asgi_request("POST", "/ingest/files", payload, "test-secret"))
+            self.assertEqual(status, 500)
+            self.assertEqual(events[-1]["error_category"], "ingest_internal_error")
+            self.assertNotIn(b"sensitive", body)
+        for value in ("private-folder", "private-file", "private document contents", "test-secret",
+                      "sensitive internal path", "secret-document-header"):
+            self.assertNotIn(value, json.dumps(events))
+
+    def test_partial_site_operation_records_counts_without_urls(self):
+        events = []
+
+        def partial(cfg, failed_urls):
+            failed_urls.append("https://example.com/private?token=secret")
+            return 0
+
+        with patch.object(config, "RAG_API_KEY", "test-secret"), \
+                patch("api.server.log_operation", side_effect=lambda event: events.append(event.copy())), \
+                patch("api.ingest_service.crawl_site", side_effect=partial):
+            status, body = asyncio.run(
+                asgi_request("POST", "/ingest/site", {"base_url": "https://example.com"}, "test-secret"))
+        self.assertEqual(status, 200)
+        self.assertEqual(len(json.loads(body)["failed_urls"]), 1)
+        self.assertEqual((events[-1]["status"], events[-1]["failed_sources"]), ("partial", 1))
+        self.assertNotIn("secret", json.dumps(events))
+
+    def test_rotated_logs_are_safe_for_parallel_threads(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(logging_utils, "LOG_DIR", Path(tmp)), \
+                patch.object(logging_utils, "LOG_MAX_BYTES", 512), patch.object(logging_utils, "LOG_BACKUP_COUNT", 20):
+            audit = logging.Logger("temporary-operations")
+            csv_logger = logging_utils.CsvLogger("parallel", fieldnames=["operation_id", "value"], key="operation_id")
+            with patch("common.logger.logging.getLogger", return_value=audit):
+                def write(number):
+                    logging_utils.log_operation({"operation_id": str(number), "event": "completed"})
+                    csv_logger.log({"operation_id": str(number), "value": str(number)})
+
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    list(pool.map(write, range(80)))
+            for handler in audit.handlers:
+                handler.close()
+            operation_events = []
+            for path in Path(tmp).glob("operations.jsonl*"):
+                operation_events.extend(json.loads(line) for line in path.read_text(encoding="utf-8").splitlines())
+            self.assertEqual({event["operation_id"] for event in operation_events}, {str(i) for i in range(80)})
+            self.assertGreater(len(list(Path(tmp).glob("operations.jsonl*"))), 1)
+            csv_rows = []
+            for path in Path(tmp).glob("parallel.csv*"):
+                with path.open(encoding="utf-8", newline="") as file:
+                    csv_rows.extend(csv.DictReader(file, delimiter=";"))
+            self.assertEqual({row["operation_id"] for row in csv_rows}, {str(i) for i in range(80)})
+
+    def test_legacy_csv_is_archived_when_schema_changes(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(logging_utils, "LOG_DIR", Path(tmp)):
+            path = Path(tmp) / "parallel.csv"
+            path.write_text("timestamp;value\nold;kept\n", encoding="utf-8")
+            csv_logger = logging_utils.CsvLogger("parallel", fieldnames=["operation_id", "value"], key="operation_id")
+            csv_logger.log({"operation_id": "new", "value": "first"})
+            csv_logger.log({"operation_id": "new", "value": "final"})
+            self.assertEqual((Path(tmp) / "parallel.csv.1").read_text(encoding="utf-8"), "timestamp;value\nold;kept\n")
+            with path.open(encoding="utf-8", newline="") as file:
+                self.assertEqual(list(csv.DictReader(file, delimiter=";")), [{"operation_id": "new", "value": "final"}])
+
     def test_api_key_is_required_at_startup(self):
         with patch.object(config, "RAG_API_KEY", ""):
             with self.assertRaisesRegex(RuntimeError, "RAG_API_KEY"):
@@ -762,6 +1003,46 @@ class RegressionTests(unittest.TestCase):
             (folder / "two.txt").unlink()
             ingest_folder(str(folder), True)
             self.assertCountEqual([row["text"] for row in data_store.snapshot().rows], ["new one", "old two"])
+
+    def test_file_ingest_writes_safe_technical_events(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(config, "DATA_DIR", Path(tmp) / "index"), \
+                patch.object(data_store, "rows", []), patch.object(data_store, "_snapshot",
+                                                                   data_store.Snapshot([], [], None, None)), \
+                patch("rag.data_store.get_embed_model", return_value=FakeEmbedding()), \
+                patch("rag.ingest.logger.info") as log:
+            folder = Path(tmp) / "private-folder"
+            folder.mkdir()
+            (folder / "private-name.txt").write_text("private content", encoding="utf-8")
+            self.assertEqual(ingest_folder(str(folder)), 1)
+            messages = str(log.call_args_list)
+            self.assertIn("files start", messages)
+            self.assertIn("file processed", messages)
+            self.assertIn("files done", messages)
+            self.assertNotIn("private", messages)
+
+    def test_site_minimum_length_uses_config(self):
+        from common.formatters import site_to_documents
+        with patch.object(config, "SITE_MIN_TEXT_CHARS", 5), \
+                patch("common.formatters.fetch_text", return_value="<p>12345</p>"):
+            self.assertEqual(len(site_to_documents("https://example.com", max_pages=1, timeout=1, user_agent="test")),
+                             1)
+
+    def test_logging_and_chunk_configuration_is_validated_at_startup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, "DATA_DIR": tmp, "LOG_DIR": str(Path(tmp) / "custom-logs"),
+                   "LOG_MAX_BYTES": "1024", "LOG_BACKUP_COUNT": "2", "LOG_LEVEL": "INFO",
+                   "INGEST_CHUNK_CHARS": "500", "INGEST_CHUNK_OVERLAP": "50"}
+            command = [sys.executable, "-B", "-c",
+                       "from common import config; print(config.LOG_DIR, config.LOG_MAX_BYTES, config.LOG_LEVEL, config.INGEST_CHUNK_CHARS)"]
+            result = subprocess.run(command, env=env, text=True, capture_output=True, check=True)
+            self.assertIn("custom-logs 1024 INFO 500", result.stdout)
+            for name, value, expected in (("LOG_LEVEL", "wrong", "LOG_LEVEL"),
+                                          ("LOG_BACKUP_COUNT", "0", "LOG_BACKUP_COUNT"),
+                                          ("INGEST_CHUNK_OVERLAP", "500", "INGEST_CHUNK_OVERLAP")):
+                with self.subTest(name=name):
+                    result = subprocess.run(command, env={**env, name: value}, text=True, capture_output=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(expected, result.stderr)
 
     def test_medqa_requires_unambiguous_letter(self):
         self.assertEqual(extract_answer("(B).\n"), "B")

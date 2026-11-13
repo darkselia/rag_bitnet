@@ -1,9 +1,18 @@
 import csv
+import json
 import logging
+import os
 import threading
-from pathlib import Path
+from contextvars import ContextVar
+from logging.handlers import RotatingFileHandler
+from typing import Any
 
-LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
+from common import config
+
+LOG_DIR = config.LOG_DIR
+LOG_MAX_BYTES = config.LOG_MAX_BYTES
+LOG_BACKUP_COUNT = config.LOG_BACKUP_COUNT
+current_operation: ContextVar[dict[str, Any] | None] = ContextVar("current_operation", default=None)
 
 _FORMAT = logging.Formatter(
     "%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -20,6 +29,9 @@ def setup_logging() -> None:
 
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
+    # PDF parser warnings can contain bytes from the input document.
+    logging.getLogger("pypdf").setLevel(logging.ERROR)
+    logging.getLogger("PyPDF2").setLevel(logging.ERROR)
 
     # ensure there is a single console handler with WARNING level
     console = None
@@ -43,7 +55,7 @@ def get_logger(name: str) -> logging.Logger:
     """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(config.LOG_LEVEL)
     logger.propagate = False
 
     # add a dedicated file handler once
@@ -58,12 +70,36 @@ def get_logger(name: str) -> logging.Logger:
         except Exception:
             # best-effort: if touch fails, FileHandler will attempt to create file
             pass
-        fh = logging.FileHandler(str(log_path), encoding="utf-8")
-        fh.setLevel(logging.DEBUG)
+        fh = RotatingFileHandler(str(log_path), maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
+        fh.setLevel(config.LOG_LEVEL)
         fh.setFormatter(_FORMAT)
         logger.addHandler(fh)
         logger._file_handler_added = True  # type: ignore[attr-defined]
     return logger
+
+
+def operation_update(**fields: Any) -> None:
+    operation = current_operation.get()
+    if operation is not None:
+        operation.update(fields)
+
+
+def log_operation(fields: dict[str, Any]) -> None:
+    logger = logging.getLogger("operations")
+    if not getattr(logger, "_operation_handler_added", False):
+        with _operation_lock:
+            if not getattr(logger, "_operation_handler_added", False):
+                LOG_DIR.mkdir(parents=True, exist_ok=True)
+                handler = RotatingFileHandler(LOG_DIR / "operations.jsonl", maxBytes=LOG_MAX_BYTES,
+                                              backupCount=LOG_BACKUP_COUNT, encoding="utf-8")
+                logger.addHandler(handler)
+                logger.setLevel(logging.INFO)
+                logger.propagate = False
+                logger._operation_handler_added = True
+    logger.info(json.dumps(fields, ensure_ascii=False, separators=(",", ":")))
+
+
+_operation_lock = threading.Lock()
 
 
 def get_console_logger(name: str) -> logging.Logger:
@@ -100,6 +136,17 @@ class CsvLogger:
                             f"Known fieldnames: {self._fieldnames}"
                         )
             LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+            rotate = self._path.exists() and self._path.stat().st_size >= LOG_MAX_BYTES
+            if self._path.exists() and self._path.stat().st_size and not rotate:
+                with self._path.open("r", newline="", encoding="utf-8") as f:
+                    rotate = next(csv.reader(f, delimiter=";"), []) != self._fieldnames
+            if rotate:
+                for number in range(LOG_BACKUP_COUNT, 0, -1):
+                    source = self._path if number == 1 else self._path.with_suffix(f".csv.{number - 1}")
+                    target = self._path.with_suffix(f".csv.{number}")
+                    if source.exists():
+                        os.replace(source, target)
 
             if self._key and self._key in row and self._path.exists() and self._path.stat().st_size > 0:
                 key_val = row[self._key]

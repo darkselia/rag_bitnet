@@ -5,6 +5,7 @@ from fastapi.security import APIKeyHeader
 
 from api import ask_service, ingest_service
 from common import config
+from common.logger import operation_update
 from schemas.app_schema import AskReq, IngestFilesReq, IngestSiteReq
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -32,4 +33,10 @@ async def ingest_site(req: IngestSiteReq):
 
 @router.post("/ask")
 async def ask(req: AskReq):
-    return await ask_service.ask(req)
+    try:
+        return await ask_service.ask(req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        operation_update(error_category="ask_internal_error", error_type=type(e).__name__)
+        raise HTTPException(status_code=500, detail="Request processing failed") from e

@@ -1,11 +1,74 @@
+import time
+import uuid
+from datetime import datetime, timezone
+
 from fastapi import FastAPI
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from api.routes import router
 from common import config
-from common.logger import setup_logging, get_console_logger
+from common.logger import current_operation, get_console_logger, log_operation, setup_logging
+
+
+class OperationMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        routes = {"/ask": "ask", "/ingest/files": "ingest_files", "/ingest/site": "ingest_site"}
+        if scope["type"] != "http" or scope["method"] != "POST" or scope["path"] not in routes:
+            await self.app(scope, receive, send)
+            return
+        started = time.monotonic()
+        operation = {"operation_id": uuid.uuid4().hex, "operation": routes[scope["path"]]}
+        token = current_operation.set(operation)
+        log_operation({**operation, "event": "started", "timestamp": datetime.now(timezone.utc).isoformat()})
+        response_status = None
+        complete = False
+
+        async def send_event(message: Message) -> None:
+            nonlocal response_status, complete
+            if message["type"] == "http.response.start":
+                response_status = message["status"]
+                message = {**message, "headers": [*message.get("headers", []),
+                                                  (b"x-request-id", operation["operation_id"].encode("ascii"))]}
+            await send(message)
+            if message["type"] == "http.response.body" and not message.get("more_body", False):
+                complete = True
+
+        try:
+            await self.app(scope, receive, send_event)
+        except BaseException as exc:
+            operation.setdefault("error_category",
+                                 "interrupted" if not isinstance(exc, Exception) else "internal_error")
+            operation["status"] = "error"
+            raise
+        finally:
+            generation_started = operation.pop("_generation_started", None)
+            if generation_started is not None and "generation_ms" not in operation:
+                operation["generation_ms"] = round((time.monotonic() - generation_started) * 1000, 2)
+            if "status" not in operation:
+                if not complete:
+                    operation.update(status="error", error_category="interrupted")
+                elif response_status is None or response_status >= 400:
+                    if response_status == 401:
+                        category = "authentication"
+                    elif response_status is not None and response_status < 500:
+                        category = "invalid_request"
+                    else:
+                        category = "internal_error"
+                    operation.update(status="error", error_category=operation.get("error_category", category))
+                else:
+                    operation["status"] = "success"
+            log_operation({**operation, "event": "completed", "timestamp": datetime.now(timezone.utc).isoformat(),
+                           "http_status": response_status,
+                           "duration_ms": round((time.monotonic() - started) * 1000, 2)})
+            current_operation.reset(token)
+
 
 setup_logging()
 app = FastAPI(title="RAG + BitNet", version="0.1.0")
+app.add_middleware(OperationMiddleware)
 app.include_router(router)
 
 logger = get_console_logger("app")
