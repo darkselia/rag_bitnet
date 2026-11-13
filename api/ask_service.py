@@ -13,9 +13,10 @@ from starlette.responses import StreamingResponse
 from clients.llm import get_llm
 from common import config
 from common.logger import CsvLogger, get_logger
-from schemas.app_schema import AskReq, AskResp, Message
+from schemas.app_schema import AskReq, AskResp, LLMResp, Message
 
 logger = get_logger("ask_service")
+NO_CONTEXT_ANSWER = "Couldn't find the answer in the database."
 
 CSV_FIELDS = [
     "timestamp", "retrieve time", "user question", "contest",
@@ -46,6 +47,24 @@ def _extract_query(messages: List[Message]) -> str:
         if msg.role == "user":
             return msg.content
     raise HTTPException(status_code=400, detail="No user message found in messages")
+
+
+def _no_context_response(
+        stream: bool, query: str, retrieve_elapsed: float, timestamp: str,
+) -> AskResp | StreamingResponse:
+    response = AskResp(answer=Message(role="assistant", content=NO_CONTEXT_ANSWER), used_context=[])
+    logger.info("answer: no context")
+    _log_csv({
+        "timestamp": timestamp,
+        "retrieve time": f"{retrieve_elapsed:.3f}",
+        "user question": query,
+        "contest": "",
+    })
+    if not stream:
+        return response
+    chunk = LLMResp(content=NO_CONTEXT_ANSWER).model_dump(exclude={"final"})
+    events = (json.dumps(event, ensure_ascii=False) + "\n" for event in (chunk, response.model_dump()))
+    return StreamingResponse(events, media_type="application/x-ndjson; charset=utf-8")
 
 
 def _stream_answer(
@@ -137,7 +156,7 @@ async def ask(req: AskReq) -> AskResp | StreamingResponse:
     logger.info("retrieve: contexts=%d elapsed=%.3fs", len(contexts), retrieve_elapsed)
 
     if not contexts:
-        raise HTTPException(status_code=404, detail="No relevant context found")
+        return _no_context_response(req.stream, query, retrieve_elapsed, timestamp)
 
     messages = [Message(role="system", content=config.SYSTEM_PROMPT)] + req.messages
     llm = get_llm()
@@ -154,6 +173,8 @@ async def ask(req: AskReq) -> AskResp | StreamingResponse:
             except (requests.RequestException, ValueError, KeyError) as e:
                 raise HTTPException(status_code=502, detail="Exact prompt tokenization unavailable") from e
             if count + config.LLM_MAX_TOKENS <= config.BITNET_CONTEXT_SIZE:
+                if not contexts:
+                    return _no_context_response(req.stream, query, retrieve_elapsed, timestamp)
                 break
             if not contexts:
                 raise HTTPException(status_code=413, detail="Messages exceed the model context window")
