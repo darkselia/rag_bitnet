@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import json
 import os
 import re
@@ -8,7 +9,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import numpy as np
+from docx import Document
 from fastapi import HTTPException
+from pypdf import PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from starlette.responses import StreamingResponse
 
 _data = tempfile.TemporaryDirectory()
@@ -21,7 +25,7 @@ from benchmarks.lm_eval_adapter import BitNetLM
 from benchmarks.run_medqa import extract_answer
 from clients.bitnet_client import BitNetAPI
 from common import config
-from common.formatters import html_to_text
+from common.formatters import file_to_document, html_to_text
 from rag import data_store, models
 from rag.ingest import chunk_text, ingest_folder
 from rag.retrieval import QueryTooLongError, _allowed_indices, _rerank
@@ -57,6 +61,24 @@ class FakeReranker:
     def predict(self, pairs, batch_size):
         self.pairs = pairs
         return [1.0 if "needle" in text else 0.1 for _, text in pairs]
+
+
+def write_test_pdf(path: Path, text: str | None) -> None:
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=200, height=200)
+    if text is not None:
+        font = DictionaryObject({
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        })
+        page[NameObject("/Resources")] = DictionaryObject({
+            NameObject("/Font"): DictionaryObject({NameObject("/F1"): font}),
+        })
+        content = DecodedStreamObject()
+        content.set_data(f"BT /F1 12 Tf 20 100 Td ({text}) Tj ET".encode("ascii"))
+        page[NameObject("/Contents")] = writer._add_object(content)
+    writer.write(str(path))
 
 
 async def asgi_request(
@@ -169,6 +191,147 @@ class RegressionTests(unittest.TestCase):
                 patch("rag.models.CrossEncoder", side_effect=[damaged, original]), \
                 patch("rag.models.torch.ao.quantization.quantize_dynamic", side_effect=RuntimeError("unavailable")):
             self.assertIs(models.get_reranker(), original)
+
+    def test_docx_preserves_document_and_table_order(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "sample.docx"
+            document = Document()
+            document.add_heading("Проверка", level=1)
+            document.add_paragraph("Первый абзац")
+            table = document.add_table(rows=1, cols=2)
+            table.cell(0, 0).text = "Цвет"
+            table.cell(0, 1).text = "Синий"
+            nested = table.cell(0, 1).add_table(rows=1, cols=1)
+            nested.cell(0, 0).text = "Вложенная таблица"
+            document.add_heading("Раздел 7", level=7)
+            document.add_paragraph("Последний абзац")
+            document.save(path)
+            formatted = file_to_document(path)
+        self.assertIsNotNone(formatted)
+        self.assertEqual(formatted.source, "sample.docx")
+        self.assertIn("# Проверка", formatted.text)
+        self.assertLess(formatted.text.index("Первый абзац"), formatted.text.index("Цвет"))
+        self.assertLess(formatted.text.index("Вложенная таблица"), formatted.text.index("Последний абзац"))
+        self.assertIn("Синий", formatted.text)
+        self.assertIn("###### Раздел 7", formatted.text)
+
+    def test_csv_formats_utf8_quoted_multiline_values(self):
+        with tempfile.TemporaryDirectory() as folder:
+            for delimiter in (",", ";"):
+                with self.subTest(delimiter=delimiter):
+                    path = Path(folder) / f"sample-{ord(delimiter)}.csv"
+                    with path.open("w", encoding="utf-8-sig", newline="") as f:
+                        writer = csv.writer(f, delimiter=delimiter)
+                        writer.writerow(["Название, код" if delimiter == ";" else "Название; код", "Описание"])
+                        writer.writerow(["Тест", 'Строка 1, "текст";\nСтрока 2'])
+                    formatted = file_to_document(path)
+                    self.assertIsNotNone(formatted)
+                    self.assertEqual(formatted.source, path.name)
+                    self.assertIn("Описание: Строка 1, \"текст\";\nСтрока 2", formatted.text)
+                    self.assertIn("Тест", formatted.text)
+
+    def test_csv_rejects_ambiguous_malformed_and_invalid_encoding(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "invalid.csv"
+            for content, message in [
+                (b"a,b;c\n1,2;3\n", "Ambiguous CSV delimiter"),
+                (b'a,b\n1,"unfinished\n', "Invalid CSV file"),
+                (b"a,b\n1\n", "column count mismatch"),
+                (b"a,b\n1,\xff\n", "must be UTF-8"),
+            ]:
+                with self.subTest(message=message):
+                    path.write_bytes(content)
+                    with self.assertRaisesRegex(ValueError, message):
+                        file_to_document(path)
+
+    def test_csv_accepts_large_field_within_file_limit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "large.csv"
+            path.write_text("name;description\nitem;" + "x" * 150000 + "\n", encoding="utf-8")
+            formatted = file_to_document(path)
+        self.assertIsNotNone(formatted)
+        self.assertIn("x" * 150000, formatted.text)
+
+    def test_ingest_indexes_supported_formats_as_separate_sources(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            document = Document()
+            document.add_paragraph("DOCX говорит: сапфир")
+            document.save(root / "sample.docx")
+            (root / "sample.csv").write_text("название;значение\nкамень;топаз\n", encoding="utf-8")
+            (root / "sample.txt").write_text("Текст: янтарь", encoding="utf-8")
+            (root / "sample.md").write_text("# Текст\nРубин", encoding="utf-8")
+            (root / "sample.html").write_text("<h1>Текст</h1><p>Алмаз</p>", encoding="utf-8")
+            write_test_pdf(root / "sample.pdf", "PDF text")
+            with patch("rag.ingest.data_store.add_chunks", return_value=6) as add:
+                self.assertEqual(ingest_folder(folder), 6)
+        chunks = add.call_args.args[0]
+        self.assertEqual({chunk["source"] for chunk in chunks}, {
+            "sample.docx", "sample.csv", "sample.txt", "sample.md", "sample.html", "sample.pdf",
+        })
+        self.assertEqual(len({chunk["meta"]["path"] for chunk in chunks}), 6)
+        self.assertTrue(any("сапфир" in chunk["text"] for chunk in chunks))
+        self.assertTrue(any("значение: топаз" in chunk["text"] for chunk in chunks))
+        self.assertTrue(any("PDF text" in chunk["text"] for chunk in chunks))
+
+    def test_pdf_without_text_reports_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            write_test_pdf(Path(folder) / "scan.pdf", None)
+            with self.assertRaisesRegex(ValueError, "No extractable text.*scan.pdf"):
+                ingest_folder(folder)
+
+    def test_bad_or_empty_files_preserve_published_index(self):
+        with tempfile.TemporaryDirectory() as docs, tempfile.TemporaryDirectory() as store:
+            root = Path(docs)
+            csv_path = root / "source.csv"
+            docx_path = root / "source.docx"
+            csv_path.write_text("предмет;цвет\nцветок;синий\n", encoding="utf-8")
+            document = Document()
+            document.add_paragraph("Документ до обновления")
+            document.save(docx_path)
+            with patch.object(config, "DATA_DIR", Path(store)), patch.object(data_store, "rows", []), \
+                    patch.object(data_store, "_snapshot", data_store.Snapshot([], [], None, None)), \
+                    patch("rag.data_store.get_embed_model", return_value=FakeEmbedding()):
+                self.assertEqual(ingest_folder(docs, replace_existing=True), 2)
+                previous = data_store.snapshot()
+                pointer = (Path(store) / "current.json").read_text(encoding="utf-8")
+                for name, content in [("source.docx", b"not a docx"), ("source.csv", b"")]:
+                    path = root / name
+                    original = path.read_bytes()
+                    path.write_bytes(content)
+                    with self.subTest(name=name), self.assertRaises(ValueError):
+                        ingest_folder(docs, replace_existing=True)
+                    self.assertIs(data_store.snapshot(), previous)
+                    self.assertEqual((Path(store) / "current.json").read_text(encoding="utf-8"), pointer)
+                    path.write_bytes(original)
+                csv_path.write_text("предмет;цвет\nцветок;красный\n", encoding="utf-8")
+                updated = Document()
+                updated.add_paragraph("Документ после обновления")
+                updated.save(docx_path)
+                self.assertEqual(ingest_folder(docs, replace_existing=True), 2)
+                self.assertTrue(any("красный" in row["text"] for row in data_store.rows))
+                self.assertFalse(any("синий" in row["text"] for row in data_store.rows))
+                self.assertTrue(any("после обновления" in row["text"] for row in data_store.rows))
+
+    def test_ingest_limits_file_batch_and_expanded_docx_size(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "a.txt").write_text("1234", encoding="utf-8")
+            (root / "b.txt").write_text("5678", encoding="utf-8")
+            with patch.object(config, "INGEST_MAX_FILE_BYTES", 3):
+                with self.assertRaisesRegex(ValueError, "File size exceeds limit"):
+                    ingest_folder(folder)
+            with patch.object(config, "INGEST_MAX_FILE_BYTES", 10), \
+                    patch.object(config, "INGEST_MAX_BATCH_BYTES", 7):
+                with self.assertRaisesRegex(ValueError, "Total file size exceeds"):
+                    ingest_folder(folder)
+            path = root / "sample.docx"
+            document = Document()
+            document.add_paragraph("Текст")
+            document.save(path)
+            with patch.object(config, "INGEST_MAX_DOCX_UNCOMPRESSED_BYTES", 1):
+                with self.assertRaisesRegex(ValueError, "DOCX uncompressed size exceeds limit"):
+                    file_to_document(path)
 
     def test_headings_bound_sections_without_splitting_source(self):
         text = "\ufeffFIRST STORY\n\nfirst text\n\nSECOND STORY\n\nsecond text"

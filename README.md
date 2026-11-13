@@ -6,7 +6,7 @@ FastAPI-сервис для RAG-чата поверх локальных док�
 
 ## Возможности
 
-- Индексация `.txt`, `.pdf`, `.md` файлов и HTML-страниц одного домена.
+- Индексация `.pdf`, `.docx`, `.txt`, `.csv`, `.md`, `.html`, `.htm` файлов и HTML-страниц одного домена.
 - Гибридный retrieval: dense embeddings (sentence-transformers) + BM25 + опциональный cross-encoder reranker.
 - Два режима LLM: **chat** (`/v1/chat/completions`) и **completion** (`/completion`) — переключаются через
   `BITNET_MODE`.
@@ -99,7 +99,7 @@ schemas/       Pydantic models (app schemas + BitNet API schemas)
 docs/          Документация проекта (в т.ч. docs/benchmarks.md)
 benchmarks/    lm-eval harness адаптеры и раннеры бенчмарков
 logs/          CSV-логи запросов, benchmark results
-data/rag_docs/      Исходные файлы для индексации (.txt, .md, .pdf)
+data/rag_docs/      Исходные файлы для индексации
 data/vector_store/  FAISS + BM25 индексы, rows.jsonl, embeddings.npy
 ```
 
@@ -115,6 +115,9 @@ data/vector_store/  FAISS + BM25 индексы, rows.jsonl, embeddings.npy
 - `SYSTEM_PROMPT` — системный промпт для RAG
 - `BITNET_HOST`, `BITNET_PORT` — адрес BitNet inference server
 - `DATA_DIR` — директория хранения индексов (по умолч. `./data/vector_store`)
+- `INGEST_MAX_FILE_BYTES` — максимальный размер одного файла, по умолчанию 25 МиБ.
+- `INGEST_MAX_BATCH_BYTES` — максимальный суммарный размер файлов одной индексации, по умолчанию 100 МиБ.
+- `INGEST_MAX_DOCX_UNCOMPRESSED_BYTES` — максимальный суммарный распакованный размер DOCX, по умолчанию 100 МиБ.
 - `BITNET_TIMEOUT` — таймаут HTTP в секундах, по умолчанию 60.
 - `BITNET_CONTEXT_SIZE` — размер контекста одного слота, при `0` проверка размера отключена. При положительном значении
   используется `/tokenize`; для chat также необходим `/apply-template`. Сервер без этих endpoints возвращает ошибку
@@ -139,10 +142,20 @@ Reranker оценивает полный чанк; если пара вопро�
 Уже проиндексированные документы нужно повторно загрузить с `replace_existing=true`, а сайты — переиндексировать,
 чтобы применить новое разбиение. Перед массовой переиндексацией сохраните копию индекса.
 
+DOCX обрабатывается с сохранением порядка абзацев, заголовков и таблиц. CSV должен быть в UTF-8 или UTF-8 с BOM и
+содержать строку заголовков и данные; поддерживаются разделители `,` и `;`, кавычки и переносы внутри значений. Если
+подходят оба разделителя или строки содержат разное число столбцов, файл отклоняется. Для одностолбцового CSV
+используется разделитель `,`.
+
+Исходные файлы остаются в указанной папке и не копируются в хранилище индекса. Для PDF необходим текстовый слой: OCR
+не выполняется. Если файл пуст, повреждён или из него не удалось извлечь текст, индексация всей папки завершается
+ошибкой до публикации новой версии; ранее проиндексированные данные сохраняются. Ограничения размеров проверяют
+входные файлы и распакованный DOCX, но не являются общим лимитом потребления оперативной памяти.
+
 ## Зависимости
 
 | Файл                     | Назначение                                                                                            |
 |--------------------------|-------------------------------------------------------------------------------------------------------|
-| `requirements.txt`       | RAG API: FastAPI, Pydantic, sentence-transformers, FAISS, Jinja2, rank-bm25, requests                 |
+| `requirements.txt`       | RAG API: FastAPI, Pydantic, sentence-transformers, FAISS, Jinja2, rank-bm25, pypdf, python-docx       |
 | `requirements-bench.txt` | Бенчмарки: `-r requirements.txt` + lm-eval, datasets, bert-score, rouge-score, bleurt, tensorflow-cpu |
 | `requirements_full.txt`  | Полный frozen-слепок всех зависимостей (воспроизводимое окружение)                                    |

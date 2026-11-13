@@ -79,6 +79,11 @@ def _env_path(name: str, default: str) -> Path:
 
 DATA_DIR = _env_path("DATA_DIR", "./data/vector_store")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+INGEST_MAX_FILE_BYTES = _env_int("INGEST_MAX_FILE_BYTES", 25 * 1024 * 1024, min_value=1)
+INGEST_MAX_BATCH_BYTES = _env_int("INGEST_MAX_BATCH_BYTES", 100 * 1024 * 1024, min_value=1)
+INGEST_MAX_DOCX_UNCOMPRESSED_BYTES = _env_int(
+    "INGEST_MAX_DOCX_UNCOMPRESSED_BYTES", 100 * 1024 * 1024, min_value=1,
+)
 
 EMBED_MODEL = _env_str("EMBED_MODEL", "intfloat/multilingual-e5-base")
 RERANKER_MODEL = _env_str("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")

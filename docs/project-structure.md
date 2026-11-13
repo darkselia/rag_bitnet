@@ -34,7 +34,7 @@ rag_bitnet/
 │   └── benchmarks/mmlu_pro/       Benchmark results (JSON + summary)
 │
 ├── data/
-│   ├── rag_docs/                  Исходные документы для индексации (.txt, .md, .pdf)
+│   ├── rag_docs/                  Исходные документы для индексации (.pdf, .docx, .txt, .csv, .md, .html, .htm)
 │   └── vector_store/              FAISS index, BM25 corpus, rows.jsonl, embeddings.npy, meta.json
 │
 ├── docs/

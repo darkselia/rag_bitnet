@@ -1,17 +1,27 @@
+import csv
 import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, TextIO
 from urllib.parse import urljoin, urldefrag
+from zipfile import BadZipFile, ZipFile
 
 import requests
 import tldextract
 from bs4 import BeautifulSoup, NavigableString
+from docx import Document
+from docx.opc.exceptions import PackageNotFoundError
+from docx.table import Table
+from docx.text.paragraph import Paragraph
+from lxml.etree import XMLSyntaxError
 
+from common import config
 from common.logger import get_logger
 
 logger = get_logger("ingest")
+# A CSV field may occupy the entire permitted file.
+csv.field_size_limit(config.INGEST_MAX_FILE_BYTES)
 
 
 @dataclass(frozen=True)
@@ -104,6 +114,101 @@ def pdf_file_to_document(path: Path) -> Optional[FormattedDocument]:
     )
 
 
+def _docx_blocks(container: Any) -> list[str]:
+    parts = []
+    for block in container.iter_inner_content():
+        if isinstance(block, Paragraph):
+            text = block.text.strip()
+            if text:
+                style = block.style
+                heading = re.fullmatch(r"Heading ([1-9])", style.name or "") if style else None
+                parts.append(f"{'#' * min(int(heading.group(1)), 6)} {text}" if heading else text)
+        elif isinstance(block, Table):
+            for row in block.rows:
+                cells = ["\n".join(_docx_blocks(cell)) for cell in row.cells]
+                if any(cells):
+                    parts.append(" | ".join(cells))
+    return parts
+
+
+def docx_file_to_document(path: Path) -> Optional[FormattedDocument]:
+    try:
+        with ZipFile(path) as archive:
+            expanded_size = sum(item.file_size for item in archive.infolist())
+        if expanded_size > config.INGEST_MAX_DOCX_UNCOMPRESSED_BYTES:
+            raise ValueError(f"DOCX uncompressed size exceeds limit: {path.name}")
+        text = "\n\n".join(_docx_blocks(Document(str(path))))
+    except (BadZipFile, KeyError, PackageNotFoundError, XMLSyntaxError) as e:
+        raise ValueError(f"Invalid DOCX file: {path.name}") from e
+    if not text:
+        return None
+    return FormattedDocument(
+        text=text,
+        source=path.name,
+        kind="docs",
+        meta={"path": _stored_path(path)},
+        stable_id=f"doc:{_stored_path(path)}",
+    )
+
+
+def _csv_delimiter(f: TextIO, filename: str) -> str:
+    header_candidates: list[str] = []
+    valid_candidates: list[str] = []
+    for delimiter in (",", ";"):
+        f.seek(0)
+        reader = csv.reader(f, delimiter=delimiter, strict=True)
+        try:
+            headers = next(reader, [])
+            if len(headers) < 2:
+                continue
+            header_candidates.append(delimiter)
+            for row in reader:
+                if row and any(value.strip() for value in row) and len(row) != len(headers):
+                    break
+            else:
+                valid_candidates.append(delimiter)
+        except csv.Error:
+            continue
+    if len(valid_candidates) == 1:
+        return valid_candidates[0]
+    if len(valid_candidates) > 1 or (not valid_candidates and len(header_candidates) > 1):
+        raise ValueError(f"Ambiguous CSV delimiter: {filename}")
+    return header_candidates[0] if header_candidates else ","
+
+
+def csv_file_to_document(path: Path) -> Optional[FormattedDocument]:
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            if not f.read(1):
+                return None
+            delimiter = _csv_delimiter(f, path.name)
+            f.seek(0)
+            reader = csv.reader(f, delimiter=delimiter, strict=True)
+            headers = [header.strip() for header in next(reader, [])]
+            if not headers or any(not header for header in headers):
+                raise ValueError(f"CSV must have a header for each column: {path.name}")
+            records = []
+            for row in reader:
+                if not row or all(not value.strip() for value in row):
+                    continue
+                if len(row) != len(headers):
+                    raise ValueError(f"CSV column count mismatch at line {reader.line_num}: {path.name}")
+                records.append("\n".join(f"{header}: {value}" for header, value in zip(headers, row)))
+    except UnicodeDecodeError as e:
+        raise ValueError(f"CSV must be UTF-8: {path.name}") from e
+    except csv.Error as e:
+        raise ValueError(f"Invalid CSV file: {path.name}") from e
+    if not records:
+        return None
+    return FormattedDocument(
+        text="\n\n".join(records),
+        source=path.name,
+        kind="docs",
+        meta={"path": _stored_path(path)},
+        stable_id=f"doc:{_stored_path(path)}",
+    )
+
+
 def file_to_document(path: Path) -> Optional[FormattedDocument]:
     suffix = path.suffix.lower()
     if suffix in {".txt", ".md"}:
@@ -112,6 +217,10 @@ def file_to_document(path: Path) -> Optional[FormattedDocument]:
         return html_file_to_document(path)
     if suffix == ".pdf":
         return pdf_file_to_document(path)
+    if suffix == ".docx":
+        return docx_file_to_document(path)
+    if suffix == ".csv":
+        return csv_file_to_document(path)
     return None
 
 

@@ -5,6 +5,7 @@ from typing import Dict, List
 
 from pydantic import BaseModel
 
+from common import config
 from common.formatters import file_to_document, site_to_documents
 from common.logger import get_logger
 from rag import data_store
@@ -124,20 +125,32 @@ def ingest_folder(folder: str, replace_existing: bool = False) -> int:
     folder_path = Path(folder)
     if not folder_path.exists():
         raise FileNotFoundError(f"Folder not found: {folder}")
-    supported_suffixes = (".txt", ".md", ".html", ".htm", ".pdf")
-    files = [
+    supported_suffixes = (".txt", ".md", ".html", ".htm", ".pdf", ".docx", ".csv")
+    files = sorted(
         Path(p)
         for p in glob.glob(str(folder_path / "**/*"), recursive=True)
-        if Path(p).suffix.lower() in supported_suffixes
-    ]
+        if Path(p).is_file() and Path(p).suffix.lower() in supported_suffixes
+    )
+    total_size = 0
+    for fp in files:
+        size = fp.stat().st_size
+        if size > config.INGEST_MAX_FILE_BYTES:
+            raise ValueError(f"File size exceeds limit: {fp.name}")
+        total_size += size
+    if total_size > config.INGEST_MAX_BATCH_BYTES:
+        raise ValueError("Total file size exceeds ingestion limit")
+
     new_chunks: List[Dict] = []
     processed_paths: set[str] = set()
     for fp in files:
         document = file_to_document(fp)
-        processed_paths.add(_stored_path(fp))
         if not document:
-            continue
-        for i, ch in enumerate(chunk_text(document.text)):
+            raise ValueError(f"No extractable text in file: {fp.name}")
+        chunks = chunk_text(document.text)
+        if not chunks:
+            raise ValueError(f"No extractable text in file: {fp.name}")
+        processed_paths.add(_stored_path(fp))
+        for i, ch in enumerate(chunks):
             new_chunks.append({
                 "id": f"doc:{_stored_path(fp)}:{i}",
                 "text": ch,

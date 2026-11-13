@@ -1,4 +1,4 @@
-### Ингест локальных TXT/MD файлов из папки docs
+### Ингест локальных PDF/DOCX/TXT/CSV/MD/HTML файлов
 # curl -X POST "http://127.0.0.1:8000/ingest/files" \
 #   -H "X-API-Key: <RAG_API_KEY>" \
 #   -H "Content-Type: application/json" \
